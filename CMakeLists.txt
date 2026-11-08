@@ -4,7 +4,8 @@
 #
 # Targets:
 #   gutenprint     libgutenprint 5.3.5, static, every family linked in
-#   print-engine   the program: describe and print (src/print-engine.c)
+#   print-engine   the program: describe and print (src/print-engine.c);
+#                  on Android the file is libprintengine.so
 #   data           Gutenprint's XML data for every family, in build/data
 #                  (scripts/build-data.py), the directory STP_DATA_PATH names
 #   check-duplicate-printers  host only: upstream's check of the printer data
@@ -23,6 +24,11 @@ add_executable(print-engine
 target_compile_definitions(print-engine PRIVATE _POSIX_C_SOURCE=200809L)
 target_compile_options(print-engine PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(print-engine PRIVATE gutenprint)
+if(ANDROID)
+  # Android extracts only files named lib<name>.so from an APK's native
+  # libraries; the program is one of them.
+  set_target_properties(print-engine PROPERTIES OUTPUT_NAME libprintengine.so SUFFIX "")
+endif()
 
 if(NOT ANDROID)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)

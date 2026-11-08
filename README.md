@@ -1,6 +1,6 @@
 # print-engine-android
 
-A command-line printing tool over [Gutenprint](https://gimp-print.sourceforge.io/): PWG Raster pages in, a printer's own bytes out. It builds and is tested on Linux. It is written to build for Android (NDK) as well, where a program can run it as a separate process for one print job; that build is not in this repository yet.
+A command-line printing tool over [Gutenprint](https://gimp-print.sourceforge.io/): PWG Raster pages in, a printer's own bytes out. It builds and is tested on Linux, and builds for Android with the NDK, where an app runs it as a separate process for one print job. An Android library module packs the Android build, Gutenprint's data and a table of the printers the data drives.
 
 The tool is one program, `print-engine`, with two commands: `describe` lists a printer driver's choices, and `print` turns pages into a print job for that driver. It knows nothing of USB, of a print spooler or of the platform it runs on: it reads its arguments, its environment and stdin, and writes stdout and stderr. The caller sends the job's bytes to the printer.
 
@@ -95,7 +95,9 @@ STP_DATA_PATH=build/data build/print-engine print --driver bjc-MP250-series \
 - `third_party/gutenprint`: the Gutenprint 5.3.5 release.
 - `CMakeLists.txt`: the build; `cmake/Gutenprint.cmake`: libgutenprint as a static library.
 - `src/print-engine.c`: the program. `src/pwg-raster.c`: the PWG Raster reader. `src/pwg-media.c`: PWG media names for Gutenprint's papers. `src/gutenprint-config/config.h`: Gutenprint's `config.h`, written by hand.
-- `scripts/build-data.py`: the data step. `scripts/import-upstream.sh`: imports an upstream release. `scripts/check-licence-notices.sh`: the licence guard.
+- `scripts/build-data.py`: the data step. `scripts/generate-resources.py`: the printer table and the data version, as Android resources. `scripts/import-upstream.sh`: imports an upstream release. `scripts/check-licence-notices.sh`: the licence guard.
+- `scripts/build-android.sh`: the NDK build of the program; `scripts/check-android-program.py`: its check. `scripts/emulator-check.sh`: runs the Android build on an emulator.
+- `android/`: the Android library module.
 - `tests/`: the host tests (Python `unittest`, run by CTest) and their data.
 
 ## How it is built
@@ -104,7 +106,29 @@ CMake builds libgutenprint from its sources as a static library, with every fami
 
 The data step, `scripts/build-data.py`, builds the data directory in `build/data`: every file that a `Makefile.am` under Gutenprint's `src/xml` installs, at the same path, for every printer family (Canon, Epson ESC/P2, PCL, dye-sub, Lexmark, DPL, PostScript, raw). Upstream's build copies these XML files unchanged and builds nothing else the library reads, so `build/data` is the same tree as upstream's `make install` writes to `share/gutenprint/5.3/xml` (checked with `diff -r` when the step was written). The data is the same on every architecture, so a cross build can pack the host's copy. The step fails when a Makefile installs into an unexpected directory or an XML file is installed by none, so an upstream change in layout fails the build instead of shipping less data. The CMake build runs upstream's check for duplicate printer entries as a test.
 
-`mise.toml` pins CMake, Ninja, shellcheck, ruff and actionlint and defines a mise task for each step: `mise tasks` lists them, and `mise run <name>` runs one with the pinned tools on the PATH. A mise task runs the ones it needs first, so `mise run test` also configures and builds. `mise run lint` runs shellcheck on `scripts/`, ruff on the Python files and actionlint on the CI workflow; any finding fails it. `mise run ci` runs the same steps as CI, in the same order. The host build also needs a C compiler and Python 3.
+### Android
+
+The same `CMakeLists.txt` builds the program for Android with the NDK's CMake toolchain file: API level 26, no C++ runtime (`ANDROID_STL=none`), linked for 16 KB pages (`ANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON`), for arm64-v8a and x86_64. On Android the program's file is named `libprintengine.so`, because Android installs only files named `lib<name>.so` from an app's native libraries; it is still an executable, not a library, and it needs no library but Android's libc, libm and libdl. The data and the tests are not part of an Android build: the data is the same on every architecture, and the host builds it.
+
+`mise run android` (`scripts/build-android.sh`) builds `build-android/<abi>/libprintengine.so` for both ABIs as a Release build, with the NDK version that `android/build.gradle.kts` names (27.2.12479018), from `$ANDROID_HOME/ndk`. Then `scripts/check-android-program.py` checks each program: an ELF executable for its ABI, position-independent, started by `/system/bin/linker64`, every LOAD segment aligned to 16 KB, and built for API level 26 (the NDK's Android note). CI runs this step too.
+
+`mise run emulator` runs the x86_64 build on an x86_64 emulator, from `adb shell`, as the host test runs the golden job: it pushes the program, the data and the test card to `/data/local/tmp`, and compares the job byte for byte with `tests/data/test-card.bjc-MP250-series.prn.gz`. `ANDROID_SERIAL` names the emulator (`ANDROID_SERIAL=emulator-5554 mise run emulator`); the check refuses a device that is not an x86_64 emulator (`ro.kernel.qemu` and `ro.product.cpu.abi`), so it never runs on a phone that is also on adb. `scripts/emulator-check.sh PROGRAM` checks another build of the program, such as the module's debug build. CI has no emulator, so this check runs by hand.
+
+### The Android library module
+
+`android/` is an Android library module, built inside the build of the app that consumes it: the app adds this repository as a git submodule and includes `android/` as a Gradle project, and the app's build supplies the Android Gradle plugin. There is no Gradle build of this repository on its own; `mise run android` checks the NDK build without one. The module holds no code that runs in the app's process. It packs:
+
+- **The program**, `lib/<abi>/libprintengine.so`: the module's CMake build (`externalNativeBuild`, target `print-engine`) with the same settings as `mise run android`. Release builds are arm64-v8a only; debug builds add x86_64, for the emulator. The app starts it from its native library directory, so the app must have the installer extract native libraries (`useLegacyPackaging`).
+- **The data**, the asset directory `printengine/`: the data step's output, the directory `STP_DATA_PATH` names once it is copied out of the APK (326 files, about 6.7 MB). The Gradle task `printEngineData` runs `scripts/build-data.py`.
+- **Two resources**, from `scripts/generate-resources.py` on that data (the Gradle task `printEngineResources`):
+  - `xml/print_engine_printers`, the printer table: one `<printer mfg="Canon" mdl="MP250 series" driver="bjc-MP250-series" />` per printer model, under the root `<print-engine-printers>`. `mfg` and `mdl` are the MFG and MDL fields of the model's IEEE 1284 device ID, and `driver` is the name `--driver` takes.
+  - `string/print_engine_data_version`, 16 hex digits of a SHA-256 over the data's files (their paths and bytes): the same data has the same version, and any change to the data gives another one. It names a copy of the data, so a consumer copies the data again when it changes.
+
+The table's rows come from the printers the data's `printers/*.xml` lists, read as XML, so the entries inside XML comments, which Gutenprint does not load, give none. A printer gives a row from its device ID (the `deviceid` attribute, keys `MFG` or `MANUFACTURER` and `MDL` or `MODEL`), when the data has one, and a row from its manufacturer and its name without the manufacturer in front (`Canon`, `Canon PIXMA MP250`: MDL `PIXMA MP250`). The device ID rows come first, then the name rows, each in the data's order. Two rows are one model when their make and model match with case, spaces and a trailing word "series" set aside (`Canon`, `MP250 series` and `CANON`, `mp250` match); only the first one is written. The `raw` and `ps` families give no rows: they write raw pixels and PostScript, not a printer's own language. Gutenprint 5.3.5's data gives about 3,900 rows. Some device IDs in the data are shared by several printers (several HP models report one ID); the first in the data's order is the one listed.
+
+### Tools
+
+`mise.toml` pins CMake, Ninja, shellcheck, ruff and actionlint and defines a mise task for each step: `mise tasks` lists them, and `mise run <name>` runs one with the pinned tools on the PATH. A mise task runs the ones it needs first, so `mise run test` also configures and builds. `mise run lint` runs shellcheck on `scripts/`, ruff on the Python files and actionlint on the CI workflow; any finding fails it. `mise run ci` runs the steps of CI's two jobs, the host job's and then the NDK build, in the same order. The host build also needs a C compiler and Python 3; the Android build needs the Android SDK (`ANDROID_HOME`, by default `~/Android/Sdk`) with the NDK, and the module's build needs Python 3 too, and the SDK's CMake 3.22.1.
 
 ## Tests
 
@@ -117,7 +141,9 @@ The data step, `scripts/build-data.py`, builds the data directory in `build/data
 - the options change the job (resolution, paper, colour mode), every listed resolution prints with every listed colour mode, an unlisted resolution is a usage error, and without `media` the page header's paper is used;
 - the exit codes: 2 for usage errors, an unknown driver and no data directory, with nothing on stdout; 3 for input that is not PWG Raster, an unsupported page type, a run past its line and a page cut short (the last two still end the job); 4 for a driver that refuses the page and for a closed stdout.
 
-`tests/guard_test.py` checks the licence guard. A change that alters the golden job on purpose, such as a Gutenprint update, makes a new golden file from the test card:
+`tests/resources_test.py` runs `scripts/generate-resources.py` and reads the table as a consumer does, by a device ID's MFG and MDL with case, spaces and a trailing "series" set aside. The MP250's device ID as measured on its USB printer interface (`MFG:Canon;CMD:BJL,BJRaster3,BSCCe,IVEC,IVECPLI;SOJ:TXT01;MDL:MP250 series;CLS:PRINTER;VER:1.020`) gives `bjc-MP250-series`, and every driver in the table is one the program describes. Small data directories written by the test check the rules above (device ID and name rows, long keys, the first row of a model, "series" as a word, commented entries, the `raw` and `ps` families, escaping) and the data version (the same for the same data, another for a changed, added or renamed file).
+
+`tests/android_program_test.py` checks `scripts/check-android-program.py` on small ELF files it writes. `tests/guard_test.py` checks the licence guard. A change that alters the golden job on purpose, such as a Gutenprint update, makes a new golden file from the test card:
 
 ```
 STP_DATA_PATH=build/data build/print-engine print --driver bjc-MP250-series \
@@ -138,6 +164,10 @@ The first commit after the repository's start imports the release tarball unchan
 1. `scripts/import-upstream.sh gutenprint <unpacked release>` replaces `third_party/gutenprint` and stages it. A plain `git add` drops the files that upstream's own `.gitignore` files match; the script adds them all and fails if any is missing.
 2. Commit the import alone, in its own pull request.
 3. Reapply the changes above, if any, each in its own commit. Bring `cmake/Gutenprint.cmake` and `src/gutenprint-config/config.h` up to the new `Makefile.am` and `configure.ac`, make a new golden file, and run `mise run ci`.
+
+## Releases
+
+Each release of an app on Google Play that ships this module tags the commit of this repository it was built from `app-v<versionName>`, where `<versionName>` is that release's version name (`app-v1.0.0`). The tag marks the source of the program and the data that release carries, for the GPL's offer of source. A release that does not move the submodule tags the same commit again under its own name. Tags are never moved or deleted.
 
 ## Working on it
 

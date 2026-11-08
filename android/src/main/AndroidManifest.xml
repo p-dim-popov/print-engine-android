@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- print-engine-android: the Android library module's manifest. The module
+     holds no code: the program (a native library file), the data (assets) and
+     resources only.
+     Copyright (C) 2026 Petar Popov
+     GPL-2.0-or-later; see README.md and COPYING. -->
+<manifest />

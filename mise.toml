@@ -11,6 +11,12 @@ shellcheck = "0.11.0"
 ruff = "0.17.4"
 actionlint = "1.7.12"
 
+[env]
+# The Android SDK: a preset location is kept (CI runners have one), else ~/Android/Sdk.
+# The NDK build needs its ndk/<version>; the emulator check needs its adb.
+ANDROID_HOME = "{{ get_env(name='ANDROID_HOME', default=env.HOME ~ '/Android/Sdk') }}"
+_.path = ["{{ env.ANDROID_HOME }}/platform-tools"]
+
 # `mise tasks` lists these; `mise run <name>` runs one with the tools above on the PATH.
 # Each mise task runs the ones it needs first, so any of them can run on its own.
 
@@ -36,7 +42,16 @@ run = "scripts/check-licence-notices.sh"
 description = "Run shellcheck on the scripts, ruff on the Python files and actionlint on the CI workflow; any finding fails"
 run = ["shellcheck scripts/*.sh", "ruff check scripts tests", "actionlint"]
 
-# The steps of .github/workflows/ci.yml, in the same order.
+[tasks.android]
+description = "Build the program with the NDK for arm64-v8a and x86_64 (build-android/<abi>/libprintengine.so) and check API level 26 and 16 KB pages"
+run = "scripts/build-android.sh"
+
+[tasks.emulator]
+description = "Run the x86_64 program on the emulator ANDROID_SERIAL names and compare its job with the golden job; refuses a device that is not an x86_64 emulator"
+depends = ["build"]
+run = ["scripts/build-android.sh x86_64", "scripts/emulator-check.sh"]
+
+# The steps of .github/workflows/ci.yml, in the same order. The emulator check is not one: CI has no emulator.
 [tasks.ci]
-description = "Run every CI step in order: lint, configure, build, test, guards"
-run = [{ task = "lint" }, { task = "configure" }, { task = "build" }, { task = "test" }, { task = "guards" }]
+description = "Run every CI step in order: lint, configure, build, test, guards (the host job), then android (the NDK job)"
+run = [{ task = "lint" }, { task = "configure" }, { task = "build" }, { task = "test" }, { task = "guards" }, { task = "android" }]
