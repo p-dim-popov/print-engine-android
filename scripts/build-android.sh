@@ -8,18 +8,20 @@
 #
 # Builds build-android/<ABI>/libprintengine.so, the program, for each ABI
 # (default: arm64-v8a and x86_64) with CMake and the NDK's toolchain file,
-# as the Android library module's build does: API level 26, no C++
-# runtime, linked for 16 KB pages, Release. Then scripts/check-android-program.py checks each
-# program. The NDK is the version android/build.gradle.kts names, under
+# as the Android library module's build does: API level 26 (the module's
+# minSdk), no C++ runtime, linked for 16 KB pages, Release. Then
+# scripts/check-android-program.py checks each program. The NDK is the
+# version android/build.gradle.kts names, under
 # $ANDROID_HOME/ndk (ANDROID_NDK_ROOT is not read: CI runners set it to
 # their default NDK); --ndk-version prints that version and exits.
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
-api=26
-ndk_version=$(sed -n 's/^ *ndkVersion = "\(.*\)"$/\1/p' "$repo/android/build.gradle.kts")
-if [[ -z $ndk_version ]]; then
-  echo "build-android.sh: no ndkVersion in android/build.gradle.kts" >&2
+gradle="$repo/android/build.gradle.kts"
+ndk_version=$(sed -n 's/^ *ndkVersion = "\(.*\)"$/\1/p' "$gradle")
+api=$(sed -n 's/^ *minSdk = \([0-9][0-9]*\)$/\1/p' "$gradle")
+if [[ -z $ndk_version || -z $api ]]; then
+  echo "build-android.sh: no ndkVersion or minSdk in android/build.gradle.kts" >&2
   exit 1
 fi
 if [[ ${1:-} == --ndk-version ]]; then

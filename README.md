@@ -34,12 +34,12 @@ Messages go to stderr, in English: the program's own, which start with `print-en
 |---|---|
 | 0 | Success. |
 | 2 | Usage error: an unknown command, argument or option, a missing `--driver`, an option value that the driver does not offer, no `STP_DATA_PATH`, or an unknown driver (also when the data directory holds no printer data). Nothing is written to stdout. |
-| 3 | Bad raster: stdin is not a PWG Raster stream that the program takes, or it ends early. |
-| 4 | Driver or output failure: the driver refused the settings or failed on a page, or writing stdout failed (a closed pipe included). |
+| 3 | Bad raster: stdin is not a PWG Raster stream that the program takes (a page type, size or resolution it refuses included), or it ends early. |
+| 4 | Driver or output failure: the driver refused the settings or failed on a page, writing stdout failed (a closed pipe included), or the program ran out of memory. |
 
 ### describe
 
-`describe` writes the driver's choices on stdout, one `KEY=VALUE` per line, and exits 0. A key that has several values has one line per value, in the driver's order. The keys:
+`describe` writes the driver's choices on stdout, one `KEY=VALUE` per line, and exits 0 (or 4 when writing stdout fails). A key that has several values has one line per value, in the driver's order. The keys:
 
 | Key | Value |
 |---|---|
@@ -60,7 +60,7 @@ A driver that does not report a key lists no line for it; the PostScript drivers
 
 `print` reads one PWG Raster stream on stdin and writes the job for the printer on stdout, as the driver produces it. The caller copies stdout to the printer.
 
-The input is PWG Raster (PWG 5102.4): the sync word `RaS2`, then each page as a 1796-byte page header followed by the page's lines in PWG Raster's run-length code. The program takes 8-bit pages only, `sgray_8` (colour space 18, one colour) and `srgb_8` (colour space 19, three colours, chunky). A stream needs at least one page; the pages of one stream may differ in size, resolution and colour space.
+The input is PWG Raster (PWG 5102.4): the sync word `RaS2`, then each page as a 1796-byte page header followed by the page's lines in PWG Raster's run-length code. The program takes 8-bit pages only, `sgray_8` (colour space 18, one colour) and `srgb_8` (colour space 19, three colours, chunky), with an `HWResolution` from 1 to 9600 dpi in each direction and at most 200,000 pixels by 200,000 lines. A stream needs at least one page; the pages of one stream may differ in size, resolution and colour space.
 
 The options:
 
@@ -121,7 +121,7 @@ The same `CMakeLists.txt` builds the program for Android with the NDK's CMake to
 - **The program**, `lib/<abi>/libprintengine.so`: the module's CMake build (`externalNativeBuild`, target `print-engine`) with the same settings as `mise run android`. Release builds are arm64-v8a only; debug builds add x86_64, for the emulator. The app starts it from its native library directory, so the app must have the installer extract native libraries (`useLegacyPackaging`).
 - **The data**, the asset directory `printengine/`: the data step's output, the directory `STP_DATA_PATH` names once it is copied out of the APK (for Gutenprint 5.3.5: 326 files, about 6.7 MB). The Gradle task `printEngineData` runs `scripts/build-data.py`.
 - **Two resources**, from `scripts/generate-resources.py` on that data (the Gradle task `printEngineResources`):
-  - `xml/print_engine_printers`, the printer table: one `<printer mfg="Canon" mdl="MP250 series" driver="bjc-MP250-series" />` per printer model, under the root `<print-engine-printers>`. `mfg` and `mdl` are the MFG and MDL fields of the model's IEEE 1284 device ID, and `driver` is the name `--driver` takes.
+  - `xml/print_engine_printers`, the printer table: one `<printer mfg="Canon" mdl="MP250 series" driver="bjc-MP250-series" />` per printer model, under the root `<print-engine-printers>`. `mfg` and `mdl` are the MFG and MDL fields of an IEEE 1284 device ID: the model's own, from the data, or the ones its name gives (below). `driver` is the name `--driver` takes.
   - `string/print_engine_data_version`, 16 hex digits of a SHA-256 over the data's files (their paths, sizes and bytes): the same data has the same version, and any change to the data gives another one. It names a copy of the data, so a consumer copies the data again when it changes.
 
 The table's rows come from the printers the data's `printers/*.xml` lists, read as XML, so the entries inside XML comments, which Gutenprint does not load, give none. A printer gives a row from its device ID (the `deviceid` attribute, keys `MFG` or `MANUFACTURER` and `MDL` or `MODEL`), when the data has one, and a row from its manufacturer and its name without the manufacturer in front (`Canon`, `Canon PIXMA MP250`: MDL `PIXMA MP250`). The device ID rows come first, then the name rows, each in the data's order. Two rows are one model when their make and model match with case, spaces and a trailing word "series" set aside (`Canon`, `MP250 series` and `CANON`, `mp250` match); only the first one is written. The `raw` and `ps` families give no rows: they write raw pixels and PostScript, not a printer's own language. Gutenprint 5.3.5's data gives about 3,900 rows. Some device IDs in the data are shared by several printers (several HP models report one ID); the first in the data's order is the one listed.
@@ -139,7 +139,7 @@ The table's rows come from the printers the data's `printers/*.xml` lists, read 
 - polarity and coverage: a white page gives an MP250 job with no ink in any band, under 64 KiB; a black page, grey or RGB, puts ink in every band of the printable area; through the `raw-data-8` driver, which writes each pixel's RGB value, white and black pages come out as all 255 and all 0, and a raster's pixels come out where they are on the page;
 - `describe` lists the MP250's A4, Letter and A5 by their PWG names, its 600 and 300 dpi, both colour modes and its defaults, and every default is one of the choices; the data holds a driver of every family;
 - the options change the job (resolution, paper, colour mode), every listed resolution prints with every listed colour mode, an unlisted resolution is a usage error, and without `media` the page header's paper is used;
-- the exit codes: 2 for usage errors, an unknown driver and no data directory, with nothing on stdout; 3 for input that is not PWG Raster, an unsupported page type, a run past its line and a page cut short (the last two still end the job); 4 for a driver that refuses the page and for a closed stdout.
+- the exit codes: 2 for usage errors, an unknown driver and no data directory, with nothing on stdout; 3 for input that is not PWG Raster, an unsupported page type, a resolution above 9600 dpi (on the first page or a later one, which still ends the job), a run past its line and a page cut short (the last two still end the job); 4 for a driver that refuses the page and for a closed stdout.
 
 `tests/resources_test.py` runs `scripts/generate-resources.py` and reads the table as a consumer does, by a device ID's MFG and MDL with case, spaces and a trailing "series" set aside. The MP250's device ID as measured on its USB printer interface (`MFG:Canon;CMD:BJL,BJRaster3,BSCCe,IVEC,IVECPLI;SOJ:TXT01;MDL:MP250 series;CLS:PRINTER;VER:1.020`) gives `bjc-MP250-series`, and every driver in the table is one the program describes. Small data directories written by the test check the rules above (device ID and name rows, long keys, the first row of a model, "series" as a word, commented entries, the `raw` and `ps` families, escaping) and the data version (the same for the same data, another for a changed, added or renamed file).
 

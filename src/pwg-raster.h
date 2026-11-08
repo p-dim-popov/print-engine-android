@@ -3,7 +3,8 @@
 
    A reader of PWG Raster streams (PWG 5102.4): the sync word, then per
    page a 1796-byte header and the page's run-length coded lines. It takes
-   8-bit sGray and 8-bit sRGB pages, chunky, and refuses everything else.
+   8-bit sGray and 8-bit sRGB pages, chunky, at 1 to 9600 dpi, and refuses
+   everything else.
 
    This program is free software; you can redistribute it and/or
    modify it under the terms of the GNU General Public License as
@@ -53,5 +54,8 @@ int pwg_read_line(pwg_reader_t *reader, unsigned char *line);
 
 /* The last error, in words. */
 const char *pwg_reader_error(const pwg_reader_t *reader);
+
+/* 1 when the last error was a failed allocation, not a bad stream. */
+int pwg_reader_out_of_memory(const pwg_reader_t *reader);
 
 #endif

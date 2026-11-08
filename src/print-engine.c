@@ -60,6 +60,20 @@ report_bad_raster(const char *why)
   fprintf(stderr, "print-engine: bad raster: %s\n", why);
 }
 
+/* Reports the reader's last error: the exit code, 3 for a bad stream or 4
+   when the reader ran out of memory, as everywhere else. */
+static int
+reader_failed(const pwg_reader_t *reader)
+{
+  if (pwg_reader_out_of_memory(reader))
+    {
+      fputs("print-engine: out of memory\n", stderr);
+      return EXIT_DRIVER_FAILED;
+    }
+  report_bad_raster(pwg_reader_error(reader));
+  return EXIT_BAD_RASTER;
+}
+
 /* Out of memory ends the program as a driver failure. */
 static void *
 checked(void *allocated)
@@ -502,7 +516,7 @@ typedef struct
   unsigned next_line;       /* the next raster line to read */
   int x0, y0;               /* raster pixel at the printable area's corner */
   int width, height;        /* the printable area in raster pixels */
-  int raster_failed;
+  int read_failed;          /* the exit code when reading the raster failed */
   int write_failed;
 } job_t;
 
@@ -544,7 +558,7 @@ image_get_row(stp_image_t *image, unsigned char *data, size_t byte_limit, int ro
 {
   job_t *job = image->rep;
   unsigned channels = job->page.channels;
-  if (job->raster_failed || job->write_failed)
+  if (job->read_failed || job->write_failed)
     return STP_IMAGE_STATUS_ABORT;
   memset(data, 0xff, byte_limit);
   long target = (long)job->y0 + row;
@@ -554,8 +568,7 @@ image_get_row(stp_image_t *image, unsigned char *data, size_t byte_limit, int ro
     {
       if (pwg_read_line(job->reader, job->line) != 0)
         {
-          job->raster_failed = 1;
-          report_bad_raster(pwg_reader_error(job->reader));
+          job->read_failed = reader_failed(job->reader);
           return STP_IMAGE_STATUS_ABORT;
         }
       job->next_line++;
@@ -677,9 +690,13 @@ print_job(const driver_t *d, const settings_t *s)
   int got = pwg_next_page(job.reader, &job.page);
   if (got <= 0)
     {
-      report_bad_raster(got == 0 ? "the input has no page" : pwg_reader_error(job.reader));
+      int failed = EXIT_BAD_RASTER;
+      if (got == 0)
+        report_bad_raster("the input has no page");
+      else
+        failed = reader_failed(job.reader);
       pwg_reader_close(job.reader);
-      return EXIT_BAD_RASTER;
+      return failed;
     }
 
   int status = 0;
@@ -701,8 +718,8 @@ print_job(const driver_t *d, const settings_t *s)
       if (number == 0)
         stp_start_job(sent, &image);
       int printed = stp_print(sent, &image);
-      if (job.raster_failed)
-        status = EXIT_BAD_RASTER;
+      if (job.read_failed)
+        status = job.read_failed;
       else if (job.write_failed)
         status = EXIT_DRIVER_FAILED;
       else if (!printed)
@@ -711,10 +728,7 @@ print_job(const driver_t *d, const settings_t *s)
           status = EXIT_DRIVER_FAILED;
         }
       else if ((got = pwg_next_page(job.reader, &job.page)) < 0)
-        {
-          report_bad_raster(pwg_reader_error(job.reader));
-          status = EXIT_BAD_RASTER;
-        }
+        status = reader_failed(job.reader);
     }
   /* A job once started is always ended, so the printer is not left
      waiting in the middle of it. */
