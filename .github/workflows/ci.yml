@@ -41,10 +41,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The mise tasks run with the tools that mise.toml pins, as in the host job.
       - uses: jdx/mise-action@v5
 
       # The runner's SDK has other NDK versions; install the one
-      # android/build.gradle.kts names.
+      # android/build.gradle.kts names. This step is CI's own: locally,
+      # `mise run android` uses the NDK in the machine's SDK.
       - name: Install the NDK
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$(scripts/build-android.sh --ndk-version)" > /dev/null
 

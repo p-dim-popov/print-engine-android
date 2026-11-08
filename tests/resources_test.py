@@ -9,6 +9,7 @@
 # STP_DATA_PATH (Gutenprint's data directory, as the build makes it).
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -26,9 +27,19 @@ MP250_DEVICE_ID = ("MFG:Canon;CMD:BJL,BJRaster3,BSCCe,IVEC,IVECPLI;SOJ:TXT01;"
                    "MDL:MP250 series;CLS:PRINTER;VER:1.020")
 
 
+LONG_KEYS = {"MANUFACTURER": "MFG", "MODEL": "MDL"}
+
+
 def fields(device_id):
-    pairs = (field.split(":", 1) for field in device_id.split(";") if ":" in field)
-    return {name.strip().upper(): value for name, value in pairs}
+    """A device ID's fields by name, the long names as the short ones; the
+    last of a repeated name counts."""
+    found = {}
+    for field in device_id.split(";"):
+        name, colon, value = field.partition(":")
+        if colon and name.strip():
+            name = name.strip().upper()
+            found[LONG_KEYS.get(name, name)] = value.strip()
+    return found
 
 
 def normalised(text):
@@ -66,8 +77,7 @@ def data_version(data_dir):
 def lookup(rows, device_id):
     """The driver a consumer finds for device_id: the first row for its key."""
     id_fields = fields(device_id)
-    wanted = key(id_fields.get("MFG", id_fields.get("MANUFACTURER", "")),
-                 id_fields.get("MDL", id_fields.get("MODEL", "")))
+    wanted = key(id_fields.get("MFG", ""), id_fields.get("MDL", ""))
     for mfg, mdl, driver in rows:
         if key(mfg, mdl) == wanted:
             return driver
@@ -112,9 +122,11 @@ class GutenprintData(unittest.TestCase):
         self.assertEqual(len(keys), len(set(keys)))
 
 
-def data_with(**files):
-    """A data directory whose printers/<name>.xml hold the given families."""
+def data_with(test, **files):
+    """A data directory whose printers/<name>.xml hold the given families,
+    removed when test ends."""
     directory = tempfile.mkdtemp()
+    test.addCleanup(shutil.rmtree, directory)
     os.mkdir(os.path.join(directory, "printers"))
     for name, families in files.items():
         with open(os.path.join(directory, "printers", f"{name}.xml"), "w", encoding="utf-8") as f:
@@ -128,9 +140,7 @@ class Rows(unittest.TestCase):
     """The rules by which printer entries become rows."""
 
     def rows(self, **files):
-        directory = data_with(**files)
-        self.addCleanup(lambda: subprocess.run(["rm", "-rf", directory], check=True))
-        return generate(directory)
+        return generate(data_with(self, **files))
 
     def test_a_printer_gives_a_row_from_its_device_id_and_one_from_its_name(self):
         rows = self.rows(canon='<family name="canon">'
@@ -146,6 +156,24 @@ class Rows(unittest.TestCase):
                          ' deviceid="MANUFACTURER:CITIZEN SYSTEMS ;MODEL:CX;" />'
                          "</family>")
         self.assertEqual(lookup(rows, "MFG:Citizen Systems;MDL:CX;"), "citizen-cx")
+
+    def test_the_last_of_a_repeated_device_id_key_counts(self):
+        rows = self.rows(pcl='<family name="pcl">'
+                         '<printer name="HP Old" manufacturer="HP" driver="hp-new"'
+                         ' deviceid="MFG:HP;MDL:Old;MODEL:New;" />'
+                         "</family>")
+        self.assertEqual(rows[0], ("HP", "New", "hp-new"))
+
+    def test_a_value_that_android_reads_as_a_reference_fails_the_build(self):
+        for name in ("Canon @string/x", "Canon ?attr/x"):
+            directory = data_with(self, canon='<family name="canon">'
+                                  f'<printer name="{name}" manufacturer="Canon" driver="x" />'
+                                  "</family>")
+            with tempfile.TemporaryDirectory() as out:
+                result = subprocess.run([sys.executable, "-I", GENERATOR, directory, out],
+                                        capture_output=True, timeout=60, check=False)
+            self.assertNotEqual(result.returncode, 0, name)
+            self.assertIn(b"reference", result.stderr)
 
     def test_a_device_id_without_a_model_gives_only_the_name_row(self):
         rows = self.rows(dyesub='<family name="dyesub">'
@@ -205,8 +233,7 @@ class Rows(unittest.TestCase):
         self.assertEqual(rows, [("Canon", "A", "a"), ("HP", 'B & "Q" <1>', "b")])
 
     def test_a_data_directory_without_printer_data_fails(self):
-        directory = data_with()
-        self.addCleanup(lambda: subprocess.run(["rm", "-rf", directory], check=True))
+        directory = data_with(self)
         with tempfile.TemporaryDirectory() as out:
             result = subprocess.run([sys.executable, "-I", GENERATOR, directory, out],
                                     capture_output=True, timeout=60, check=False)
@@ -219,10 +246,9 @@ class DataVersion(unittest.TestCase):
     another for any change."""
 
     def setUp(self):
-        self.directory = data_with(canon='<family name="canon">'
+        self.directory = data_with(self, canon='<family name="canon">'
                                    '<printer name="Canon A" manufacturer="Canon" driver="a" />'
                                    "</family>")
-        self.addCleanup(lambda: subprocess.run(["rm", "-rf", self.directory], check=True))
 
     def write(self, path, text):
         os.makedirs(os.path.dirname(os.path.join(self.directory, path)), exist_ok=True)

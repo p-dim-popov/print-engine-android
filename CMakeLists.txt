@@ -12,6 +12,14 @@
 cmake_minimum_required(VERSION 3.22)
 project(print_engine C)
 
+# Every Android build is linked for 16 KB pages: the NDK's toolchain option
+# sets the linker's page size and hides bionic's PAGE_SIZE constant. The
+# module's Gradle build and scripts/build-android.sh both pass it; a build
+# without it fails here.
+if(ANDROID AND NOT ANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES)
+  message(FATAL_ERROR "Configure Android builds with -DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON")
+endif()
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_EXTENSIONS OFF)
 

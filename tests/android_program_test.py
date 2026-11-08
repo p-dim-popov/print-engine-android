@@ -18,7 +18,8 @@ CHECK = os.path.join(HERE, "..", "scripts", "check-android-program.py")
 EM_X86_64 = 62
 EM_AARCH64 = 183
 ET_EXEC, ET_DYN = 2, 3
-PT_LOAD, PT_INTERP, PT_NOTE = 1, 3, 4
+PT_LOAD, PT_DYNAMIC, PT_INTERP, PT_NOTE = 1, 2, 3, 4
+DT_NULL, DT_NEEDED, DT_STRTAB = 0, 1, 5
 NT_ANDROID_TYPE_IDENT = 1
 
 
@@ -29,24 +30,36 @@ def android_note(api):
 
 
 def elf(machine=EM_X86_64, kind=ET_DYN, interpreter=b"/system/bin/linker64\0",
-        load_alignments=(0x4000, 0x4000), note=None):
+        load_alignments=(0x4000, 0x4000), note=None, needed=("libm.so", "libdl.so", "libc.so")):
     """An ELF64 file with program headers only: the interpreter, the LOAD
-    segments' alignments and an Android ident note."""
+    segments' alignments (the first holds the dynamic string table), an
+    Android ident note and the dynamic section's needed libraries. Each
+    segment's address is its file offset."""
+    strings = b"\0" + b"".join(name.encode() + b"\0" for name in needed)
+    count = (interpreter is not None) + len(load_alignments) + 2
+    offset = 64 + 56 * count
     segments = []
     if interpreter is not None:
         segments.append((PT_INTERP, interpreter, 1))
-    segments += [(PT_LOAD, b"", alignment) for alignment in load_alignments]
+    strtab = offset + sum(len(data) for _, data, _ in segments)
+    segments += [(PT_LOAD, strings if index == 0 else b"", alignment)
+                 for index, alignment in enumerate(load_alignments)]
     segments.append((PT_NOTE, android_note(26) if note is None else note, 4))
-    header_size, entry_size = 64, 56
-    offset = header_size + entry_size * len(segments)
+    dynamic, at = b"", 1
+    for name in needed:
+        dynamic += struct.pack("<QQ", DT_NEEDED, at)
+        at += len(name) + 1
+    dynamic += struct.pack("<QQQQ", DT_STRTAB, strtab, DT_NULL, 0)
+    segments.append((PT_DYNAMIC, dynamic, 8))
     headers, payload = b"", b""
     for kind_of_segment, data, alignment in segments:
-        headers += struct.pack("<IIQQQQQQ", kind_of_segment, 4, offset + len(payload), 0, 0,
+        at = offset + len(payload)
+        headers += struct.pack("<IIQQQQQQ", kind_of_segment, 4, at, at, at,
                                len(data), len(data), alignment)
         payload += data
     ident = b"\x7fELF" + bytes([2, 1, 1]) + bytes(9)
-    header = ident + struct.pack("<HHIQQQIHHHHHH", kind, machine, 1, 0, header_size, 0, 0,
-                                 header_size, entry_size, len(segments), 64, 0, 0)
+    header = ident + struct.pack("<HHIQQQIHHHHHH", kind, machine, 1, 0, 64, 0, 0,
+                                 64, 56, len(segments), 64, 0, 0)
     return header + headers + payload
 
 
@@ -80,6 +93,17 @@ class CheckAndroidProgram(unittest.TestCase):
 
     def test_a_segment_aligned_for_4_kb_pages_is_refused(self):
         self.assertRefused(self.check(elf(load_alignments=(0x4000, 0x1000))), "16 KB")
+
+    def test_a_segment_without_an_alignment_is_refused(self):
+        self.assertRefused(self.check(elf(load_alignments=(0x4000, 0))), "16 KB")
+
+    def test_a_truncated_file_is_refused(self):
+        self.assertRefused(self.check(elf()[:80]), "truncated")
+
+    def test_a_program_that_needs_another_library_is_refused(self):
+        self.assertEqual(self.check(elf(needed=("libc.so",))).returncode, 0)
+        self.assertRefused(self.check(elf(needed=("libc.so", "libc++_shared.so"))),
+                           "libc++_shared.so")
 
     def test_a_program_for_another_api_level_is_refused(self):
         self.assertRefused(self.check(elf(note=android_note(30))), "API level 30")

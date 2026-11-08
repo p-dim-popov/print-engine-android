@@ -7,28 +7,69 @@
 #
 # Passes (exit 0) when PROGRAM is a 64-bit ELF program for ABI (arm64-v8a or
 # x86_64): position-independent, started by Android's /system/bin/linker64,
-# every LOAD segment aligned for 16 KB pages (a multiple of 16384), and built
-# for API_LEVEL (the NDK's Android ident note). Each failed check is a line
-# on stderr, and the exit code is 1; 2 is a usage error.
+# every LOAD segment aligned for 16 KB pages (a multiple of 16384), built for
+# API_LEVEL (the NDK's Android ident note), and needing no shared library
+# but libc, libm and libdl. Each failed check is a line on stderr, and the
+# exit code is 1; 2 is a usage error.
 import struct
 import sys
 
 MACHINES = {"arm64-v8a": 183, "x86_64": 62}
 ET_DYN = 3
-PT_LOAD, PT_INTERP, PT_NOTE = 1, 3, 4
+PT_LOAD, PT_DYNAMIC, PT_INTERP, PT_NOTE = 1, 2, 3, 4
+DT_NULL, DT_NEEDED, DT_STRTAB = 0, 1, 5
+LIBRARIES = {"libc.so", "libm.so", "libdl.so"}
 NT_ANDROID_TYPE_IDENT = 1
 INTERPRETER = b"/system/bin/linker64"
 PAGE = 16384
 
 
+class Truncated(Exception):
+    pass
+
+
 def segments(data):
-    """(type, file bytes, alignment) of each program header."""
+    """(type, file offset, address, file bytes, alignment) of each program
+    header."""
     phoff, = struct.unpack_from("<Q", data, 32)
     phentsize, phnum = struct.unpack_from("<HH", data, 54)
+    found = []
     for index in range(phnum):
-        kind, _, offset, _, _, size, _, align = struct.unpack_from(
-            "<IIQQQQQQ", data, phoff + index * phentsize)
-        yield kind, data[offset:offset + size], align
+        at = phoff + index * phentsize
+        if at + 56 > len(data):
+            raise Truncated
+        kind, _, offset, address, _, size, _, align = struct.unpack_from("<IIQQQQQQ", data, at)
+        if offset + size > len(data):
+            raise Truncated
+        found.append((kind, offset, address, data[offset:offset + size], align))
+    return found
+
+
+def needed_libraries(data, headers):
+    """The DT_NEEDED names of the dynamic section."""
+    entries = []
+    for kind, _, _, content, _ in headers:
+        if kind == PT_DYNAMIC:
+            for at in range(0, len(content) - 15, 16):
+                tag, value = struct.unpack_from("<QQ", content, at)
+                if tag == DT_NULL:
+                    break
+                entries.append((tag, value))
+    strtab = next((value for tag, value in entries if tag == DT_STRTAB), None)
+    if strtab is None:
+        return []
+    base = next((offset + strtab - address for kind, offset, address, content, _ in headers
+                 if kind == PT_LOAD and address <= strtab < address + len(content)), None)
+    if base is None:
+        raise Truncated
+    names = []
+    for tag, value in entries:
+        if tag == DT_NEEDED:
+            end = data.find(b"\0", base + value)
+            if end < 0:
+                raise Truncated
+            names.append(data[base + value:end].decode(errors="replace"))
+    return names
 
 
 def android_api_levels(note):
@@ -53,19 +94,26 @@ def problems(data, abi, api):
         found.append(f"machine {machine}, not {abi}'s {MACHINES[abi]}")
     if kind != ET_DYN:
         found.append("not a position-independent executable")
-    headers = list(segments(data))
-    interpreters = [content.rstrip(b"\0") for k, content, _ in headers if k == PT_INTERP]
+    try:
+        headers = segments(data)
+        needed = needed_libraries(data, headers)
+    except Truncated:
+        return found + ["truncated: a program header or segment lies past the end of the file"]
+    interpreters = [content.rstrip(b"\0") for k, _, _, content, _ in headers if k == PT_INTERP]
     if interpreters != [INTERPRETER]:
         found.append(f"interpreter {interpreters}, not {INTERPRETER.decode()}")
-    loads = [align for k, _, align in headers if k == PT_LOAD]
-    if not loads or any(align % PAGE for align in loads):
+    loads = [align for k, _, _, _, align in headers if k == PT_LOAD]
+    if not loads or any(align == 0 or align % PAGE for align in loads):
         found.append(f"LOAD alignments {[hex(a) for a in loads]}, not 16 KB pages")
-    levels = [level for k, content, _ in headers if k == PT_NOTE
+    levels = [level for k, _, _, content, _ in headers if k == PT_NOTE
               for level in android_api_levels(content)]
     if not levels:
         found.append("no Android note")
     else:
         found.extend(f"API level {level}, not {api}" for level in levels if level != api)
+    others = [name for name in needed if name not in LIBRARIES]
+    if others:
+        found.append(f"needs {others}; only {sorted(LIBRARIES)} are allowed")
     return found
 
 
@@ -80,7 +128,8 @@ def main(argv):
         sys.stderr.write(f"check-android-program.py: {argv[1]}: {problem}\n")
     if found:
         return 1
-    print(f"{argv[1]}: {argv[2]}, API level {argv[3]}, PIE, linker64, 16 KB LOAD alignment")
+    print(f"{argv[1]}: {argv[2]}, API level {argv[3]}, PIE, linker64, 16 KB LOAD alignment,"
+          " libc, libm and libdl only")
     return 0
 
 
