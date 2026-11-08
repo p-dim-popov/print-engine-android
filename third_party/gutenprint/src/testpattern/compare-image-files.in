@@ -1,0 +1,48 @@
+#!@SHELL@
+
+# Compare ESC/P2 Raster files' dot positions to determine amount of error.
+#
+# Copyright 2016 Robert Krawitz (rlk@alum.mit.edu)
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation; either version 2 of the License, or (at your option)
+# any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+# or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+# for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+old=$1
+new=$2
+
+if [ -z "$old" ] || [ -z "$new" ] || [ ! -d "$old" ] || [ ! -d "$new" ] ; then
+    echo "Usage: $0 dir1 dir2"
+    exit 1
+fi
+
+#files=$(ls $old | grep '\.prn$' |grep -v 'DitherAlgorithm_\(Predithered\|VeryFast\)')
+files=$(cat |grep 'DitherAlgorithm_Ordered_')
+
+for x in $files ; do
+    f="$old/$x.prn"
+    g="$new/$x.prn"
+    if [ -f "$f" ] && [ -f "$g" ] ; then
+	cmp -s "$f" "$g" || (
+	    rm -f old.pnm new.pnm
+	    ../../test/unprint "$f" > old.pnm 2>/dev/null
+	    ../../test/unprint "$g" > new.pnm 2>/dev/null
+#	    change=$(compare -metric ae old.pnm new.pnm /dev/null 2>&1)
+#	    echo "$change | " $(perl -e "print $change") "|"
+	    change=$(perl -e "print $(compare -metric ae old.pnm new.pnm /dev/null 2>&1)")
+	    size=$(($(head -2 old.pnm |tail -1 |sed 's/ /*/')))
+	    pct=$(perl -e "printf('%0.4f%%', 100*$change/$size)")
+	    error=$(((32768+(65536*change))/size))
+	    printf '%10s %10s %8s %5s %s\n' "$change" "$size" "$pct" "$error" "$x"
+	)
+    fi
+done

@@ -1,0 +1,941 @@
+#!/bin/bash
+
+## Copyright (C) 2018 Robert Krawitz
+##
+## This program is free software; you can redistribute it and/or modify
+## it under the terms of the GNU General Public License as published by
+## the Free Software Foundation; either version 2, or (at your option)
+## any later version.
+##
+## This program is distributed in the hope that it will be useful,
+## but WITHOUT ANY WARRANTY; without even the implied warranty of
+## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+## GNU General Public License for more details.
+##
+## You should have received a copy of the GNU General Public License
+## along with this program.  If not, see <https://www.gnu.org/licenses/>.
+##
+## Build release tarball
+
+# Note that the shebang line is explicit here, not indirected through
+# autoconf.  This allows the script to be run in a non-initialized workspace.
+# We also require this script to be run in the root of a workspace so that
+# it can find the script directory to get the version without having to be
+# autotool-processed.
+
+function xtput() {
+    if [[ -z ${STP_TEST_RECURSIVE:-} && -n ${TERM:-} && ${TERM:-} != dumb ]] ; then
+	tput "$@"
+    fi
+}
+
+set -u
+
+# shellcheck disable=SC2155
+{
+declare -r tbold="$(xtput bold)"
+declare -r tred="$(xtput setaf 1)$tbold"
+declare -r tyellow="$(xtput setaf 3)$tbold"
+declare -r tgreen="$(xtput setaf 2)$tbold"
+declare -r tpurple="$(xtput setaf 5)$tbold"
+declare -r tblue=$(xtput setaf 4)
+declare -r tcyan=$(xtput setaf 6)
+declare -r treset=$(xtput sgr0)
+}
+declare -i exitstatus=1
+declare -i stepstatus=-1
+declare currentmodule=
+declare -a failedmodules=()
+declare top_log
+function fatal() {
+    echo "${tred}FATAL: $*${treset}"
+    exit 1
+}
+
+# shellcheck disable=SC2155
+declare GIT=$(type -p git)
+[[ -n $GIT ]] || fatal "Can't find git"
+
+"$GIT" rev-parse --show-toplevel >/dev/null 2>&1 || fatal "Current directory is not a git workspace"
+declare rootdir
+rootdir="$("$GIT" rev-parse --show-toplevel 2>/dev/null)"
+[[ -n $rootdir ]] || fatal "Can't find workspace root"
+cd "$rootdir" || fatal "Can't cd to workspace root ($rootdir)"
+[[ -s ChangeLog.pre-5.2.11 ]] || fatal "$rootdir does not appear to be a Gutenprint tree"
+
+# shellcheck disable=SC2155
+declare MAKE=$(type -p make)
+[[ -n $MAKE ]] || fatal "Can't find make"
+
+# shellcheck disable=SC2155
+declare -r ROOT=$(pwd)
+declare tmpfile=/dev/null
+export STP_PARALLEL=${STP_PARALLEL:-$("$ROOT/scripts/count-cpus")}
+declare counter=1
+declare git_dirty=
+declare build_type=release
+[[ -n ${STP_BUILD_SNAPSHOT:-} ]] && build_type=snapshot
+
+# This can't simply be a constant because scripts/gversion might
+# not exist (or may be incorrect) prior to autogen being run.
+function pkg_version() {
+    "$ROOT/scripts/gversion" pkg
+}
+
+function version() {
+    "$ROOT/scripts/gversion" full-version
+}
+
+function pkg_tag() {
+    # shellcheck disable=SC2155
+    local version=$(pkg_version)
+    echo "${version//./_}"
+}
+
+# Clean up any trailing whitespace.
+
+function preflight() {
+    # shellcheck disable=SC2155
+    local trailing_ws="$("$GIT" grep -Il '[	 ]$' ':(exclude)po/*.po')"
+    if [[ -n $trailing_ws ]] ; then
+	console_log "*** ERROR: The following files have trailing whitespace:"
+	console_log "$trailing_ws"
+	return 2
+    fi
+    return 0
+}
+
+# Git pre-checks (not version-specific)
+
+function check_git() {
+    "$GIT" fetch
+    local gstatus=0
+
+    # Check for uncommitted files.
+    if [[ -n $("$GIT" status -uno --porcelain) ]] ; then
+	console_log "*** ERROR: Uncommitted changes in repository:"
+	"$GIT" status -uno --porcelain | console_log
+	gstatus=2
+    fi
+
+    # Ensure that the workspace is up to date (git status -uno
+    # --porcelain -b |grep -v ahead is empty -- it's OK to be ahead,
+    # but not behind) and that we don't need to rebase (no merges.
+    # Also check that we haven't diverged.
+
+    # shellcheck disable=SC2155
+    local ahead=$("$GIT" rev-list '@{u}..@')
+    # shellcheck disable=SC2155
+    local behind=$("$GIT" rev-list '@..@{u}')
+    if [[ -n $ahead && -n $behind ]] ; then
+	# Oops!  Both ahead *and* behind remote.  Really bad news!
+	console_log "*** ERROR: HEAD and remote have diverged!"
+	console_log "***        Please merge and rebase all changes!"
+	return 2
+    elif [[ -n $behind ]] ; then
+	# We're behind.  Not good.
+	console_log "*** ERROR: Behind remote by $(wc -w <<< "$behind") commits."
+	return 2
+    elif [[ -n $ahead ]] ; then
+	# We're ahead.  That's OK as long as there are no merge commits.
+	local merges=0
+	for h in $ahead ; do
+	    (( $("$GIT" rev-parse "$h^@" |wc -w) > 1 )) && merges=$((merges + 1))
+	done
+	console_log "*** Warning: Ahead of remote."
+	if (( merges > 0 )) ; then
+	    (( merges != 1 )) && pl=s
+	    console_log "*** ERROR: $merges merge${pl:-} between HEAD and remote"
+	    return 2
+	fi
+    fi
+    return $gstatus
+}
+
+# Run autogen.sh to ensure that we're using default build settings
+# Everything else depends on this.
+
+function run_target() {
+    make "$1" && return 0
+    local lstatus=$?
+    console_log "*** ERROR: ${3:+$3 }make $1 failed"
+    (( lstatus >= 127 )) && return $lstatus
+    return "${2:-2}"
+}
+
+function run_maintainer_clean() {
+    if [[ -f Makefile ]] ; then
+	run_target maintainer-clean
+    else
+	return 0
+    fi
+}
+
+function run_autogen() {
+    # shellcheck disable=SC2086
+    ./autogen.sh ${STP_CONFIG_ARGS:-} && return 0
+    console_log "*** FATAL: autogen failed!"
+    return 1
+}
+
+function colorize() {
+    sed \
+	-e "s/\*\*\* \(FATAL\|ERROR\):\(.*\)/${tred}*** \1:\2${treset}/" \
+	-e "s/\*\*\* Warning:\(.*\)/${tyellow}*** Warning:\1${treset}/"
+}
+
+function run_clean() {
+    run_target clean
+}
+
+function run_build() {
+    run_target "${STP_PARALLEL:+-j$STP_PARALLEL}" 1
+}
+
+# Same as above, without make clean if we know we're in a clean
+# environment (e. g. CI)
+function run_build_fresh() {
+    # shellcheck disable=SC2086
+    ./autogen.sh ${STP_CONFIG_ARGS:-} && make "${STP_PARALLEL:+-j$STP_PARALLEL}" && return 0
+    console_log "*** FATAL preliminary build failed!"
+    return 1
+}
+
+# Git check tag.  This can't be run until after the build, because we
+# don't have the version available until autogen.
+
+function check_git_tag() {
+    # Make sure that the tag that we're going to want to apply isn't
+    # already present.
+    [[ $build_type != release ]] && return 0
+    if [[ -n $("$GIT" show-ref "refs/tags/$(pkg_tag)") ]] ; then
+	console_log "*** ERROR: Tag named $(pkg_tag) is already present"
+	return 2
+    fi
+}
+
+function _cleanup_test_repo() {
+    if [[ -d $TESTREPO ]] ; then
+	rm -rf -- "$TESTREPO"
+    fi
+}
+
+# Check that we can build a clone of this workspace
+function _check_git_builds() {
+    # shellcheck disable=SC2155
+    export TESTREPO=$(mktemp -d "/tmp/stpbuild.XXXXXXXX")
+    trap _cleanup_test_repo EXIT SIGHUP SIGINT SIGQUIT SIGTERM
+    # shellcheck disable=SC2155
+    local rev=$("$GIT" rev-parse @)
+    cwd=$(pwd -P)
+    [[ -n $cwd ]] || {
+	console_log "*** ERROR: Can't find directory!"
+	return 2
+    }
+    cd "$TESTREPO" || {
+	console_log "*** ERROR: Can't cd to test repo directory $cwd!"
+	(( $? >= 127 )) && return 127
+	return 2
+    }
+    "$GIT" clone "$cwd" . || {
+    	console_log "*** ERROR: Unable to clone repo"
+	(( $? >= 127 )) && return 127
+	return 2
+    }
+    "$GIT" checkout "$rev" || {
+    	console_log "*** ERROR: Unable to check out rev $rev"
+	(( $? >= 127 )) && return 127
+	return 2
+    }
+    STP_TEST_RECURSIVE=$((${STP_TEST_RECURSIVE?-0}+1)) STP_LOG_NO_SUBDIR=1 STP_LOG_DIR=$STP_TEST_LOG_PREFIX scripts/build-release preflight run_autogen run_build run_distcheck_minimal || {
+	console_log "*** ERROR: Repo build failed!"
+	(( $? >= 127 )) && return 127
+	return 2
+    }
+}
+
+function check_git_builds() {
+    (_check_git_builds)
+}
+
+# Run make valgrind-minimal.
+#
+#    This does a *very* limited set of valgrind checks, running
+#    testpattern and rastertogutenprint on 9 (currently) selected
+#    printers.  It takes about 30 seconds on my laptop.  Smoketest and
+#    all.
+
+function run_valgrind_minimal() {
+    run_target check-valgrind-minimal
+}
+
+function run_valgrind_fast() {
+    run_target check-valgrind-fast
+}
+
+function run_check_minimal() {
+    run_target check-minimal
+}
+
+function run_check_fast() {
+    run_target check-fast
+}
+
+# Run make distcheck-fast.
+#
+#    This actually builds the tarball, unpacks the tarball, builds it
+#    out of tree, runs a short set of tests against it, does a local
+#    make install, followed by make uninstall, and makes sure no
+#    debris is left around.  This runs configure with all default
+#    arguments, so it is testing dynamically linked executables.
+#
+#    The particular tests it runs are:
+#
+#    - Conformance tests all non-translated non-simplified PPD files
+#      and distinct global ones.
+#
+#    - Runs test-rastertogutenprint on distinct printers, with fast
+#      options (minimum paper size, lowest resolution, very fast
+#      dithering).
+#
+#    - Runs run-testpattern-2:
+#
+#      + Distinct printers, fast options
+#
+#      + Selected printers, with cross product of input mode (and bit
+#        depth), color correction, ink type, and use gloss.
+#
+#    It also has the property of maybe updating the .po files.  These
+#    will later need to be committed and included in the tag.  So we
+#    have to do our check for uncommitted bits prior to this.
+#
+#    It has not escaped me that this could be part of a CI testing
+#    process.  I don't know if Sourceforge has the necessary gittage
+#    (as GitHub does) to allow a merge bot to run something like this
+#    and only merge to the main repository if this suite passes.
+#
+#    The reason for the distcheck-fast is so that if something stupid
+#    goes wrong it gets caught quickly.  It takes about 270 seconmds
+#    on my laptop.  It would be Kind Of Annoying to spend hours
+#    testing only to find out that something's not handling destdir
+#    correctly or make clean isn't removing something.
+#
+#    Note that this can't be combined with valgrind, since this builds
+#    dynamic executables which can't conveniently be valground since
+#    they're actually shell scripts.
+#
+#    There's now an even faster check, distcheck-minimal, that only
+#    tests a handful of printers.  It takes about 50 seconds to run.
+#    But that's really most useful for testing the distcheck
+#    apparatus.
+#
+# So far we're at just over 5 minutes on a Skylake Xeon E3-1505Mv5,
+# which isn't too bad for a prerelease smoke test.  The rest of this
+# takes a lot longer.
+
+function run_distcheck_fast() {
+    run_target distcheck-fast
+}
+
+# Run make check-valgrind
+#
+# This is slow.  It tests only unique printers, and a lot of extra
+# combinations with a few printers, all using fast options.  It
+# uses both CUPS and run-testpattern-2 testing.  However, it's
+# essentially embarrassingly parallel.
+#
+# I'd like not to go too long without running it, as it's easy for
+# things to make their way in.  For CI purposes, if we ever go
+# there, like to find a happy medium.
+
+function run_valgrind() {
+    run_target check-valgrind
+}
+
+# Run make check-full
+#
+#    This one I'm not sure of; do we need this or is this well enough
+#    covered by the combination of distcheck-fast and check-valgrind?
+#    It does take a while, but I haven't benchmarked it lately.
+#
+#    - Conformance test all PPD files
+#
+#    - Run test-rastertogutenprint on all printers, with default options
+#
+#    - Runs run-testpattern-2:
+#
+#      + Distinct printers, default options
+#
+#      + All printers, fast options
+#
+#      + Distinct printers, fast options, with cross product of input
+#        mode (and bit depth), color correction, ink type, and use
+#        gloss.
+#
+#    IIRC this takes 60-90 minutes on my laptop, but again, it
+#    parallelizes very well.
+
+function run_full() {
+    run_target check-full
+}
+
+# Run make checksums-release to generate a new regression file.
+#
+# The problem here is what do we require for the release build.  Do
+# we require a clean regression run (other than added
+# printers/modes)?  There are legitimate reasons for changing, and
+# having to rerun the procedure because the release engineer forgot a
+# command line option is a bit harsh.  Something better might be to
+# simply record changes unless there's an outright failure here, and
+# let those be reviewed.
+#
+# For CI purposes, the default might be to require no changes, with
+# human intervention if there are.
+#
+# This takes about 30 minutes on my laptop.  This is extremely
+# scalable.  Give us a really big machine instance to run it on, this
+# will run really fast.
+
+function run_checksums() {
+    make checksums
+    local lstatus=$?
+    if (( lstatus == 0 )) ; then
+	# shellcheck disable=SC2155
+	local csum_file="src/testpattern/Checksums/sums.$(pkg_version).zpaq"
+	if [[ ! -f $csum_file ]] ; then
+	    console_log "*** ERROR: Can't find new checksums file $csum_file"
+	    (( lstatus > 127 )) && return $lstatus
+	    return 2
+	fi
+	cp -p "$csum_file" "$ARTIFACTDIR"
+	return 0
+    fi
+    console_log "*** ERROR: make checksums failed"
+    (( lstatus > 127 )) && return $lstatus
+    return 2
+}
+
+# Fetch the translations
+
+function fetch_translations() {
+    rsync -Lrtzv rsync://translationproject.org/tp/latest/gutenprint/ po/
+}
+
+# Prep the release
+
+function git_prep_release() {
+    # .po files might have changed; nothing else should have!
+    # Add any of those changed files.
+    if [[ $build_type == release ]] ; then
+	"$GIT" add -u || return 1
+	# Add the checksums file.
+	# TBD whether to do this for snapshots.  The file's not very big,
+	# but it's completely incompressible!
+	"$GIT" add -f "src/testpattern/Checksums/sums.$(pkg_version).zpaq" || return 1
+	# Commit this change
+	"$GIT" commit -m"Gutenprint $(pkg_version) release" || return 1
+    else
+	# Don't update the .po files for every snapshot.
+	echo "Cleaning up .po files"
+	"$GIT" checkout -- po
+    fi
+    # Shouldn't have anything left after this.
+    if "$GIT" status -uno --porcelain |grep -q -E -v 'po/.*\.po' ; then
+	console_log "*** ERROR: Unexpected untracked files:"
+	"$GIT" status -uno --porcelain |grep -E -v 'po/.*\.po' | console_log
+	return 1
+    fi
+    # Apply the tag.  Ideally we should sign the tag too.
+    # But don't tag snapshot builds.
+    [[ $build_type != release ]] && return 0
+    "$GIT" tag -a "$(pkg_tag)" -m "Gutenprint $(pkg_version) release" || return 1
+}
+
+function git_final_cleanup() {
+    if [[ $build_type != release ]] ; then
+	# Don't update the .po files for every snapshot.
+	echo "Cleaning up .po files"
+	"$GIT" checkout -- po
+    fi
+    # Shouldn't have anything left after this.
+    echo "Cleaning up .po files"
+    git checkout -- po
+    if "$GIT" status -uno --porcelain |grep -q -E -v 'po/.*\.po' ; then
+	console_log "*** ERROR: Unexpected untracked files:"
+	"$GIT" status -uno --porcelain |grep -E -v 'po/.*\.po' | console_log
+	return 1
+    fi
+    return 0
+}
+
+# make distcheck-minimal
+#
+# We have to rebuild the tarball in any event here, so that we pick up
+# the tag (to get a correct change log) and updated .po files.
+# A minimal distcheck only takes about a minute; we might as well
+# do a final sanity check.
+
+function run_distcheck_minimal() {
+    run_target distcheck-minimal 1 Final
+}
+
+function run_check_minimal() {
+    run_target check-minimal
+}
+
+#  Save away build
+function save_build_artifacts() {
+    # shellcheck disable=SC2155
+    local tarball="$(pkg_version).tar.xz"
+    if [[ -s $tarball ]] ; then
+	cp -p "$tarball" "$ARTIFACTDIR"
+    else
+	echo "Cannot find $tarball"
+	return 1
+    fi
+}
+
+# Final release prep
+
+function finis() {
+    local extra_verbiage=
+    [[ $build_type == release ]] && {
+	local printer_list_data
+	printer_list_data=$(STP_DATA_PATH=src/xml test/gen-printer-list) || return 1
+	cat > "printer-list.$(version)" <<EOF
+<?
+require('functions.php');
+###############################################
+##    Set title of this page here    ##########
+\$title = 'Gutenprint Supported Printers';
+###############################################
+###############################################
+require('standard_html_header.php');
+
+
+### Content Below  ###
+# Please remember to use <P> </P> tags !  ?>
+
+<p>Please note that many of these drivers are currently under
+development, and we do not necessarily have full specifications on all
+of them.  We will fill in this list as we verify successful operation
+of these printers.  You can help by testing this with your own printer
+and reporting the results!</p>
+
+<table summary="Supported printers for Gutenprint $version">
+<caption style="font-size:135%;margin-bottom:0.50em;"><b>Gutenprint $version</b></caption>
+$printer_list_data
+</table>
+
+
+<?require('standard_html_footer.php');?>
+EOF
+	extra_verbiage=$(cat <<EOF
+
+  * Update the web site
+
+  * Copy the updated printer list in ${tcyan}printer-list.$(version)${tpurple}
+    to p_Supported_Printers.php and upload that to the web site.
+EOF
+)
+}
+    console_log <<EOF
+${tpurple}
+================================================================
+Remainder to be done manually:
+
+  * git push
+
+  * git push --tags
+
+  * Upload the tarball (${tcyan}$(pkg_version).tar.xz${tpurple})
+$extra_verbiage
+================================================================
+$treset
+EOF
+    return 0
+}
+
+################################################################
+#
+# Runtime
+#
+################################################################
+
+# Note that if we change the format of this timestamp we have to
+# change console_log if the width changes.
+#
+# Unfortunately the shell built-in printf can't specify UTC.
+function stamp() {
+    printf '%(%Y-%m-%dT%H:%M:%S%z)T' -1
+}
+
+function date_sec() {
+    printf '%(%s)T' -1
+}
+
+function report_progress() {
+    local outst="RUNNING[$1]: "
+    shift
+    # shellcheck disable=SC2046
+    echo $([[ -z ${BUILD_VERBOSE:-} ]] && echo '' -n) ">>> $(stamp) $outst $*"
+}
+
+# This allows us to log to multiple outputs, including stdout and
+# (where available) file descriptors.  Ideally we'd be able to build a
+# pipeline and eval it, but it's not clear that that's possible.
+function log1() {
+    if [[ $# -eq 0 || ($# == 1 && $1 == -) ]] ; then
+	exec cat
+    else
+	local dest="$1"
+	shift
+	# stdout needs to come last, because we just want to send data
+	# to stdout rather than teeing off or explicitly going to a file.
+	if [[ $dest == - && $# -gt 0 ]] ; then
+	    # Protect against someone inadvertently specifying '-' twice!
+	    # shellcheck disable=SC2046
+	    log1 "$@" $([[ $1 == - ]] || echo -)
+	elif [[ $dest == -* ]] ; then
+	    dest=${dest:1}
+	    destdir=${dest%/*}
+	    [[ -n $destdir && ! -d $destdir ]] && mkdir -p "$destdir"
+	    if (( $# == 0 )) ; then
+		exec cat > "$dest"
+	    elif [[ $* == - ]] ; then
+		exec tee "$dest"
+	    else
+		exec tee "$dest" | log1 "$@"
+	    fi
+	else
+	    destdir=${dest%/*}
+	    [[ -n $destdir && ! -d $destdir ]] && mkdir -p "$destdir"
+	    if (( $# == 0 )) ; then
+		exec cat >> "$dest"
+	    elif [[ $* == - ]] ; then
+		exec tee -a "$dest"
+	    else
+		exec tee -a "$dest" | log1 "$@"
+	    fi
+	fi
+    fi
+}
+
+function log() {
+    (log1 "$@" ${BUILD_VERBOSE:+-})
+}
+
+function log_top1() {
+    log "$top_log" -
+}
+
+function red() {
+    sed -e "s/^/${tred}/" -e "s/$/${treset}/"
+}
+
+function green() {
+    sed -e "s/^/${tgreen}/" -e "s/$/${treset}/"
+}
+
+function log_top() {
+    if [[ -n "$*" ]] ; then
+	log_top1 <<< "$*"
+    else
+	log_top1
+    fi
+}
+
+# Log the output to the console as well as the master log file and the
+# per-operation log file.
+#
+# fd#4 (/dev/fd/4 -- let's hope we're building the package on
+#      a system that supports /dev/fd, but linux does)
+#      in the operation gets tied to stderr
+#
+# Note that fd#3 is used by lower levels
+#
+# Then we timestamp the data and send it to the top-level log (which
+# is not normally timestamped).
+#
+# Finally, we remove the existing timestamp (which relies upon the timestamp
+# format, ugh) and send it to stdout where it gets picked up and timestamped
+# again.
+function console_log1() {
+    if [[ -n ${STP_TEST_RECURSIVE:-} ]] ; then
+	tee >(exec cat 1>&4) >(timestamp | log_top | cut -c26-)
+    else
+	timestamp | log_top - | cut -c26-
+    fi
+}
+
+function console_log_immediate1() {
+    case "${STP_TEST_RECURSIVE:-0}" in
+	2)
+	    tee >(exec cat 1>&6) >(exec cat 1>&5) >(exec cat 1>&4) >(timestamp | log_top | cut -c26-)
+	    ;;
+	1)
+	    tee >(exec cat 1>&5) >(exec cat 1>&4) >(timestamp | log_top | cut -c26-)
+	    ;;
+	*)
+	    tee >(exec cat 1>&2) >(timestamp | log_top | cut -c26-)
+	    ;;
+    esac
+}
+
+function console_log() {
+    if [[ -n "$*" ]] ; then
+	console_log1 <<< "$*"
+    else
+	console_log1
+    fi
+}
+
+function console_log_immediate() {
+    if [[ -n "$*" ]] ; then
+	console_log_immediate1 <<< "$*"
+    else
+	console_log_immediate1
+    fi
+}
+
+function time_delta() {
+    local -i i=$((${2:-0} - ${1:-0}))
+    printf "%d:%02d:%02d" $((i / 3600)) $(((i % 3600) / 60)) $((i % 60))
+}
+
+function report_step_status() {
+    (( stepstatus == -1 )) && return
+    [[ -z ${BUILD_VERBOSE:-} ]] && {
+	local ststatus=OK
+	local stcolor="${tgreen}"
+	if (( stepstatus)) ; then
+	    ststatus=FAILED
+	    stcolor="${tred}"
+	    if (( stepstatus == 126 )) ; then
+		ststatus="NOT FOUND"
+		stcolor="${tpurple}"
+	    elif (( stepstatus >= 127 )) ; then
+		ststatus=INTERRUPTED
+	    fi
+	fi
+	printf "$stcolor%$((longest_op - ${#op} ))s $ststatus$treset\n"
+    }
+    [[ -n $currentmodule && $stepstatus -ne 0 ]] && failedmodules+=("$currentmodule")
+    currentmodule=
+    if [[ -f $tmpfile ]] ; then
+	[[ -s $tmpfile ]] && colorize < "$tmpfile"
+	rm -f -- "$tmpfile"
+    fi
+    stepstatus=-1
+}
+
+# shellcheck disable=SC2155
+function finish() {
+    local status=$exitstatus
+    local etime=$(date_sec)
+    local estamp=$(stamp)
+    report_step_status
+    if [[ $status != 0 || -n ${failedmodules[*]:-} ]] ; then
+	log_top "The following modules failed:"
+	log_top "$(printf "    %s\n" "${failedmodules[@]:-}")"
+	log_top "*** Gutenprint $build_type build FAILED at $estamp ($(time_delta "$stime" "$etime"))" |red
+    else
+	log_top "*** Gutenprint $build_type build completed at $estamp ($(time_delta "$stime" "$etime"))" |green
+    fi
+    log "$top_log" <<< "================================================================"
+    if [[ -n ${TRAVIS_MODE:-} ]] ; then
+	# We really don't want the termination message from the deadman
+	exec 3>&2 2>/dev/null
+	kill %travis_deadman
+	wait %travis_deadman
+	exec 2>&3 3>&-
+    fi
+    trap - EXIT
+    exit "$status"
+}
+
+# Travis times out if there's no output for 10 minutes, but some things
+# go silent for quite a while
+function travis_deadman() {
+    while : ; do sleep 60; echo -e "\n${tblue}Mark $(uptime)${treset}" | log -; done
+}
+
+function timestamp() {
+    while read -r ; do echo "$(stamp) $REPLY"; done
+}
+
+# Run one operation.
+# shellcheck disable=SC2155
+function runit() {
+    local cmdname=$1
+    local cmd="$*"
+    local fcounter=$(printf "%02d" "$counter")
+    local local_logdir="$logdir/$fcounter.${cmd// /_/}"
+    mkdir -p "$local_logdir"
+    local logfile="$local_logdir/Master"
+    [[ -n ${DONTRUN_OP:-} ]] && logfile=/dev/null
+    local sstime=$(date_sec)
+    local ssstamp=$(stamp)
+    local status=0
+    local msg=completed
+    log "-$logfile" "$top_log" <<< "----------------------------------------------------------------"
+    if [[ -z ${DONTRUN_OP:-} ]] ; then
+	echo "$cmdname started at $ssstamp" | log "$logfile" "$top_log"
+	echo "Command: $cmd" | log "$logfile" "$top_log"
+	echo "Log file: ${logfile#${logdir}/}" | log "$top_log"
+    else
+	echo "$cmdname SKIPPED" | log "$top_log"
+    fi
+    report_progress "$fcounter" "$cmdname"
+
+    if [[ -z ${DONTRUN_OP:-} ]] ; then
+	#
+	stepstatus=127
+	currentmodule="$cmdname"
+	# Run the command, capturing console output as well as logged output.
+	if [[ -z $(type -t "$cmdname") ]] ; then
+	    msg="NOT FOUND"
+	    # 126 is also used for "permission denied", which amounts
+	    # to the same thing -- it's something the user should not
+	    # have tried to run.
+	    stepstatus=126
+	else
+	    if [[ -n ${STP_TEST_RECURSIVE:-} ]] ; then
+		STP_TEST_RECURSIVE=2 STP_TEST_LOG_PREFIX="$local_logdir/" $cmd </dev/null 4>"$tmpfile" 6>&5 5>&2 3>&1 2>&1 | timestamp | log "$logfile"
+	    else
+		STP_TEST_RECURSIVE=1 STP_TEST_LOG_PREFIX="$local_logdir/" $cmd </dev/null 4>"$tmpfile" 5>&2 3>&1 2>&1 | timestamp | log "$logfile"
+	    fi
+	    stepstatus=${PIPESTATUS[0]}
+	    (( stepstatus > 0 )) && msg=FAILED
+	fi
+	local -a emptyfiles=()
+	for f in "$local_logdir"/* ; do
+	    [[ -f $f && ! -s $f ]] && emptyfiles+=("$f")
+	done
+	[[ -n "${emptyfiles[*]:-}" ]] && rm -f -- "${emptyfiles[@]}"
+    else
+	msg='(SKIPPED)'
+    fi
+    local setime=$(date_sec)
+    local sestamp=$(stamp)
+    if [[ -z ${DONTRUN_OP:-} ]] ; then
+	echo "$cmd $msg at $sestamp ($(time_delta "$sstime" "$setime"))" | log "$logfile" "$top_log"
+	echo "----------------------------------------------------------------" | log "$logfile" "$top_log"
+    fi
+    counter=$((counter+1))
+}
+
+declare -a OPERATIONS=(preflight
+		       check_git
+		       check_git_tag
+		       run_maintainer_clean
+		       run_autogen
+		       run_clean
+		       run_build
+		       check_git_builds
+		       run_valgrind_minimal
+		       run_distcheck_fast
+		       run_valgrind
+		       run_full
+		       run_checksums
+		       fetch_translations
+		       run_distcheck_minimal
+		       git_prep_release
+		       run_distcheck_minimal
+		       save_build_artifacts
+		       finis
+		       git_final_cleanup)
+
+function get_longest_op() {
+    local longest_op=0
+    local op
+    for op in "${OPERATIONS[@]}" ; do
+	(( ${#op} > longest_op )) && longest_op=${#op}
+    done
+    echo $((longest_op + 2))
+}
+
+# shellcheck disable=SC2206
+[[ -n ${STP_BUILD_OPERATIONS:-} ]] && OPERATIONS=($STP_BUILD_OPERATIONS)
+[[ -n "$*" ]] && OPERATIONS=("$@")
+
+trap finish EXIT SIGHUP SIGINT SIGQUIT SIGTERM
+
+# shellcheck disable=SC2155
+{
+declare sstamp=$(stamp)
+declare stime=$(date_sec)
+}
+declare toplogdir=${STP_LOG_DIR:-"$ROOT/BuildLogs"}
+declare logdir="$toplogdir/Log.${sstamp// /_}"
+[[ -n ${STP_LOG_NO_SUBDIR:-} ]] && logdir=$toplogdir
+top_log="$logdir/00.Master"
+mkdir -p "$logdir"
+if [[ -z ${STP_LOG_NO_SUBDIR:-} ]] ; then
+     if [[ -L $toplogdir/Current ]] ; then
+	 rm -f -- "$toplogdir/Previous"
+	 mv "$toplogdir/Current" "$toplogdir/Previous"
+     fi
+    ln -s "${logdir##*/}" "$toplogdir/Current"
+fi
+export ARTIFACTDIR="$logdir/Artifacts"
+mkdir -p "$ARTIFACTDIR"
+
+[[ -n $("$GIT" status --porcelain -uno) ]] && git_dirty=' (dirty)'
+log "-$top_log" <<< "================================================================"
+
+log_top <<EOF
+${tbold}*** Gutenprint $build_type build started at $sstamp on $(uname -n)${treset}
+
+Directory:   $ROOT
+Logs:        ${logdir#${ROOT}/}
+Kernel:      $(uname -o) $(uname -rv)
+Revision:    $("$GIT" rev-parse @)$git_dirty
+Parallel:    $STP_PARALLEL
+EOF
+
+[[ -n ${STP_TEST_ROTOR_CIRCUMFERENCE:-} && -n ${STP_TEST_ROTOR:-} ]] &&
+    log_top "Rotor:       $STP_TEST_ROTOR / $STP_TEST_ROTOR_CIRCUMFERENCE"
+
+# Or we could just do "env" here, but having them sorted makes it
+# easier to read.  Variables containing '%%' are functions
+log_top <<EOF
+
+Environment:
+$(while read -r var ; do
+    eval "echo '    '$var=\${$var@Q}"
+done <<< "$(compgen -e)")
+
+CPU information:
+$(lscpu -e)
+$(lscpu)
+
+Memory information:
+$(free)
+
+Running operations:
+EOF
+
+if [[ -n ${TRAVIS_MODE:-} ]] ; then
+    export BUILD_VERBOSE=1
+    travis_deadman&
+fi
+
+declare -A SKIP_OPS
+[[ -n ${STP_BUILD_SKIP:-} ]] &&
+    for o in ${STP_BUILD_SKIP//,/ } ; do SKIP_OPS[$o]=1; done
+declare -i runstatus=0
+# shellcheck disable=SC2155
+declare -i longest_op=$(get_longest_op)
+declare -i lstatus=0
+for op in "${OPERATIONS[@]}" ; do
+    [[ -z ${BUILD_VERBOSE:-} ]] && tmpfile=$(mktemp "/tmp/stpconsole.XXXXXXXX")
+    DONTRUN_OP="${DONTRUN:-}${SKIP_OPS[$op]:-}" runit "$op"
+    lstatus=$stepstatus
+    report_step_status
+    if (( lstatus > 0 )) ; then
+	runstatus=1
+	(( lstatus != 2 )) && break
+    fi
+done
+exitstatus="$runstatus"

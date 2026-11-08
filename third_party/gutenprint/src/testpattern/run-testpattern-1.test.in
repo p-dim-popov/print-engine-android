@@ -1,0 +1,358 @@
+#!@BASHREAL@
+
+# Driver for test pattern generator
+#
+# Copyright 2004-2008 Robert Krawitz (rlk@alum.mit.edu) and other
+# members of the Gutenprint project.
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation; either version 2 of the License, or (at your option)
+# any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+# or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+# for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+if [[ -n "$STP_TEST_LOG_PREFIX" ]] ; then
+    redir="${STP_TEST_LOG_PREFIX}${0##*/}_$$.log"
+    if [[ -n $BUILD_VERBOSE ]] ; then
+	exec > >(tee -a "$redir" >&3)
+    else
+	exec 1>>"$redir"
+    fi
+    exec 2>&1
+fi
+
+[[ -n $STP_TEST_COMPONENTS && $STP_TEST_COMPONENTS != '*testpattern*' ]] && exit 77
+
+if [[ $STP_TEST_PROFILE != full && -n $STP_TEST_SUITE ]] ; then
+    exit 77
+fi
+
+if [[ -n $STP_TEST_DEBUG ]] ; then
+    echo "Would run $0 $*"
+    exit 0
+fi
+
+if [[ -z $srcdir || $srcdir = "." ]] ; then
+    sdir=$(pwd)
+elif grep -q '^/' <<< "$srcdir" ; then
+    sdir="$srcdir"
+else
+    sdir="$(pwd)/$srcdir"
+fi
+
+if [ -z "$STP_DATA_PATH" ] ; then
+    STP_DATA_PATH="$sdir/../xml"
+    export STP_DATA_PATH
+fi
+
+if [ -z "$STP_MODULE_PATH" ] ; then
+    STP_MODULE_PATH="$sdir/../main:$sdir/../main/.libs"
+    export STP_MODULE_PATH
+fi
+
+valgrind=0
+valopts=''
+extra=''
+dontrun=
+output=
+
+set_opt() {
+    opt=$(echo "$1" | awk -F= '{print $1}')
+    val=$(echo "$1" | awk -F= '{print $2}')
+    extra="$(printf '%s\nparameter \"%s\" \"%s\";' "$extra" "$opt" "$val")"
+}
+
+set_message() {
+    the_message="$(printf '%s\nmessage \"%s\";' "$the_message" "$*")"
+}
+
+usage() {
+    echo "Usage: run-testpattern [-v|--valgrind]"
+    echo "                       [-p|--parameter parameter=value]"
+    echo "                       [-n|--dontrun]"
+    echo "                       [-O|--output]"
+    echo "                       [--] [printers...]"
+    exit 0;
+}
+
+print_command='cat'
+
+set_args() {
+    while true ; do
+	case "$1" in
+	    -h*|--h*) usage ;;
+	    -v|--valgrind) valopts='--tool=memcheck' ; valgrind=$((valgrind+1)) ;;
+	    -c|--cachegrind) valopts='--skin=cachegrind'; valgrind=4 ;;
+	    -g|--gdb-attach) valopts='--vgdb=yes' ;;
+	    -p|--parameter) shift; set_opt "$1" ;;
+    	    -n|--dontrun) dontrun=1 ;;
+	    -O|--output) shift; output="$1" ;;
+	    -o|--one) print_command=run_testpattern; dontrun=1 ;;
+	    --) shift; args="$*"; return ;;
+	    *) return ;;
+	esac
+    shift
+    done
+}
+
+print_one_testpattern() {
+    printer=$1
+    mode=$2
+    bits=$3
+    inktype=$4
+    correction=$5
+    printingmode=$6
+    shift
+    shift
+    shift
+    shift
+    shift
+    shift
+    stuff="$*"
+    cat <<EOF
+printer "$printer";
+$stuff
+parameter "InkType" "$inktype";
+parameter "ColorCorrection" "$correction";
+parameter "PrintingMode" "$printingmode";
+parameter "DitherAlgorithm" "VeryFast";
+hsize 0.1;
+vsize 0.1;
+left 0.15;
+top 0.15;
+blackline 0;
+steps 16;
+mode $mode $bits;
+pattern 0.0 0.0 0.0 0.0 0.0 0.0 0.0 1.0  0.0 0.0 1.0  0.0 0.0 1.0  0.0 0.0 1.0 ;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.0 1.0  0.0 1.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.0 1.0  0.0 0.0 1.0 0.0 1.0 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 1.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.0 1.0  0.0 1.0 1.0 0.0 1.0 1.0 0.0 1.0 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.0 1.0  0.0 -2.0 1.0 0.0 -2.0 1.0 0.0 -2.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 -2.0 -2.0 -2.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.1 0.3 1.0 1.0 1.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.3 0.7 -2.0 -2.0 -2.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.1 0.999 1.0 1.0 1.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.3 0.999 1.0 1.0 1.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.5 0.999 1.0 1.0 1.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.1 0.3 -2.0 -2.0 -2.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.3 0.7 1.0 1.0 1.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.1 0.999 -2.0 -2.0 -2.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.3 0.999 -2.0 -2.0 -2.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.5 0.999 -2.0 -2.0 -2.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.0 1.0  0.0 0.0 1.0 0.0 1.0 1.0 0.0 1.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.25 1.0  0.0 0.0 1.0 0.0 0.75 1.0 0.0 0.75 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.25 1.0  0.0 0.0 1.0 0.0 0.75 1.0 0.0 0.75 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.5 1.0  0.0 0.0 1.0 0.0 0.5 1.0 0.0 0.5 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.5 1.0  0.0 0.0 1.0 0.0 0.5 1.0 0.0 0.5 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.75 1.0  0.0 0.0 1.0 0.0 0.25 1.0 0.0 0.25 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.75 1.0  0.0 0.0 1.0 0.0 0.25 1.0 0.0 0.25 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.9 1.0  0.0 0.0 1.0 0.0 0.1 1.0 0.0 0.1 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.9 1.0  0.0 0.0 1.0 0.0 0.1 1.0 0.0 0.1 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.0 1.0  0.0 1.0 1.0 0.0 0.0 1.0 0.0 1.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.25 1.0  0.0 0.75 1.0 0.0 0.0 1.0 0.0 0.75 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.25 1.0  0.0 0.75 1.0 0.0 0.0 1.0 0.0 0.75 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.5 1.0  0.0 0.5 1.0 0.0 0.0 1.0 0.0 0.5 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.5 1.0  0.0 0.5 1.0 0.0 0.0 1.0 0.0 0.5 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.75 1.0  0.0 0.25 1.0 0.0 0.0 1.0 0.0 0.25 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.75 1.0  0.0 0.25 1.0 0.0 0.0 1.0 0.0 0.25 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.9 1.0  0.0 0.1 1.0 0.0 0.0 1.0 0.0 0.1 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.9 1.0  0.0 0.1 1.0 0.0 0.0 1.0 0.0 0.1 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.0 1.0  0.0 1.0 1.0 0.0 1.0 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.25 1.0  0.0 0.75 1.0 0.0 0.75 1.0 0.0 0.0 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.25 1.0  0.0 0.75 1.0 0.0 0.75 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.5 1.0  0.0 0.5 1.0 0.0 0.5 1.0 0.0 0.0 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.5 1.0  0.0 0.5 1.0 0.0 0.5 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.75 1.0  0.0 0.25 1.0 0.0 0.25 1.0 0.0 0.0 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.75 1.0  0.0 0.25 1.0 0.0 0.25 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.9 1.0  0.0 0.1 1.0 0.0 0.1 1.0 0.0 0.0 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.9 1.0  0.0 0.1 1.0 0.0 0.1 1.0 0.0 0.0 1.0;
+end;
+EOF
+}
+
+print_one_raw_testpattern() {
+    printer=$1
+    mode=$2
+    bits=$3
+    inktype=$4
+    correction=$5
+    printingmode=$6
+    shift
+    shift
+    shift
+    shift
+    shift
+    shift
+    stuff="$*"
+    cat <<EOF
+printer "$printer";
+$stuff
+parameter "InkType" "$inktype";
+parameter "ColorCorrection" "$correction";
+parameter "PrintingMode" "$printingmode";
+page_size 256 256;
+blackline 0;
+steps 256;
+mode $mode $bits;
+pattern 0.0 0.0 0.0 0.0 0.0 0.0 0.0 1.0  0.0 0.0 1.0  0.0 0.0 1.0  0.0 0.0 1.0 ;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.0 1.0  0.0 1.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.0 1.0  0.0 0.0 1.0 0.0 1.0 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 1.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.0 1.0  0.0 1.0 1.0 0.0 1.0 1.0 0.0 1.0 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.0 1.0  0.0 -2.0 1.0 0.0 -2.0 1.0 0.0 -2.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 -2.0 -2.0 -2.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.1 0.3 1.0 1.0 1.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.3 0.7 -2.0 -2.0 -2.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.1 0.999 1.0 1.0 1.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.3 0.999 1.0 1.0 1.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.5 0.999 1.0 1.0 1.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.1 0.3 -2.0 -2.0 -2.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.3 0.7 1.0 1.0 1.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.1 0.999 -2.0 -2.0 -2.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.3 0.999 -2.0 -2.0 -2.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.5 0.999 -2.0 -2.0 -2.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.0 1.0  0.0 0.0 1.0 0.0 1.0 1.0 0.0 1.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.25 1.0  0.0 0.0 1.0 0.0 0.75 1.0 0.0 0.75 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.25 1.0  0.0 0.0 1.0 0.0 0.75 1.0 0.0 0.75 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.5 1.0  0.0 0.0 1.0 0.0 0.5 1.0 0.0 0.5 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.5 1.0  0.0 0.0 1.0 0.0 0.5 1.0 0.0 0.5 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.75 1.0  0.0 0.0 1.0 0.0 0.25 1.0 0.0 0.25 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.75 1.0  0.0 0.0 1.0 0.0 0.25 1.0 0.0 0.25 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.9 1.0  0.0 0.0 1.0 0.0 0.1 1.0 0.0 0.1 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.9 1.0  0.0 0.0 1.0 0.0 0.1 1.0 0.0 0.1 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.0 1.0  0.0 1.0 1.0 0.0 0.0 1.0 0.0 1.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.25 1.0  0.0 0.75 1.0 0.0 0.0 1.0 0.0 0.75 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.25 1.0  0.0 0.75 1.0 0.0 0.0 1.0 0.0 0.75 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.5 1.0  0.0 0.5 1.0 0.0 0.0 1.0 0.0 0.5 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.5 1.0  0.0 0.5 1.0 0.0 0.0 1.0 0.0 0.5 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.75 1.0  0.0 0.25 1.0 0.0 0.0 1.0 0.0 0.25 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.75 1.0  0.0 0.25 1.0 0.0 0.0 1.0 0.0 0.25 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.9 1.0  0.0 0.1 1.0 0.0 0.0 1.0 0.0 0.1 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.9 1.0  0.0 0.1 1.0 0.0 0.0 1.0 0.0 0.1 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.0 1.0  0.0 1.0 1.0 0.0 1.0 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.25 1.0  0.0 0.75 1.0 0.0 0.75 1.0 0.0 0.0 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.25 1.0  0.0 0.75 1.0 0.0 0.75 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.5 1.0  0.0 0.5 1.0 0.0 0.5 1.0 0.0 0.0 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.5 1.0  0.0 0.5 1.0 0.0 0.5 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.75 1.0  0.0 0.25 1.0 0.0 0.25 1.0 0.0 0.0 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.75 1.0  0.0 0.25 1.0 0.0 0.25 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.9 1.0  0.0 0.1 1.0 0.0 0.1 1.0 0.0 0.0 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.9 1.0  0.0 0.1 1.0 0.0 0.1 1.0 0.0 0.0 1.0;
+end;
+EOF
+}
+
+run_testpattern() {
+    suppress=-n
+    if [ -n "$output" ] ; then
+	suppress=''
+    fi
+    case "$valgrind" in
+	1) libtool --mode=execute valgrind $valopts -q --num-callers=100 --leak-check=yes --error-limit=no ./testpattern $suppress ;;
+	2) libtool --mode=execute valgrind $valopts --num-callers=100 --leak-resolution=high --leak-check=yes --error-limit=no ./testpattern $suppress ;;
+	3) libtool --mode=execute valgrind $valopts --error-limit=no --num-callers=100 --show-reachable=yes --leak-resolution=high --leak-check=yes ./testpattern $suppress ;;
+	4) libtool --mode=execute valgrind $valopts ./testpattern $suppress ;;
+	*) ./testpattern $suppress ;;
+    esac
+    (( $? != 0 )) && return 1
+    return 0
+}
+
+set_args $(getopt hgvp:ncoO: "$@")
+
+StandardBitDepths="8 16"
+StandardModes="rgb kcmy cmyk cmy gray white"
+StandardColorCorrections="None Density Desaturated Accurate Bright Uncorrected Threshold Raw Predithered"
+StandardInkTypes="CMYKRB CMYK RGB"
+StandardPrintingModes="BW Color"
+
+RawBitDepths="8 16"
+#RawTypes="raw-data-8 raw-data-16"
+RawModes="rgb kcmy cmyk cmy gray white"
+RawColorCorrections="None Density Desaturated Accurate Bright Uncorrected Threshold Raw Predithered"
+RawInkTypes="CMYK RGB CMY KCMY RGBGray CMYGray"
+RawPrintingModes="BW Color"
+
+the_message=''
+
+if [[ -z $dontrun && -n $output && ! -d $output ]] ; then
+    mkdir "$output" || {
+	echo "Cannot create directory '$output'"
+	exit 1
+    }
+fi
+
+test_rotor=${STP_TEST_ROTOR:-0}
+test_rotor_circumference=${STP_TEST_ROTOR_CIRCUMFERENCE:-1}
+test_count=-1
+
+print_all_testpatterns() {
+    for a in $RawPrintingModes ; do
+	for b in $RawInkTypes ; do
+	    for c in $RawColorCorrections ; do
+		for d in $RawModes ; do
+		    for e in $RawBitDepths ; do
+			test_count=$((test_count+1))
+			(( test_count % test_rotor_circumference != test_rotor )) && continue
+			set_message "Raw $a $b $c $d $e"
+			if [[ -n $output ]] ; then
+			    outstuff="$(printf '\n%s\n' \"output \\\""$output"/raw-data-8_"$a"_"$b"_"$c"_"$d"_"$e"\\\";\")"
+			fi
+			print_one_raw_testpattern "raw-data-8" "$d" "$e" "$b" "$c" "$a" "$extra" "$the_message" "$outstuff"| $print_command
+			the_message=""
+		    done
+		done
+	    done
+	done
+    done
+    for a in $StandardPrintingModes ; do
+	for b in $StandardInkTypes ; do
+	    for c in $StandardColorCorrections ; do
+		for d in $StandardModes ; do
+		    for e in $StandardBitDepths ; do
+			test_count=$((test_count+1))
+			(( test_count % test_rotor_circumference != test_rotor )) && continue
+			set_message "R800 $a $b $c $d $e"
+			if [[ -n $output ]] ; then
+			    outstuff="$(printf '\n%s\n' \"output \\\""$output"/raw-data-8_"$a"_"$b"_"$c"_"$d"_"$e"\\\";\")"
+			fi
+			print_one_testpattern "escp2-r800" "$d" "$e" "$b" "$c" "$a" "$extra" "$the_message" "$outstuff" | $print_command
+			the_message=""
+		    done
+		done
+	    done
+	done
+    done
+    for a in $StandardColorCorrections ; do
+	for b in $StandardBitDepths ; do
+	    test_count=$((test_count+1))
+	    (( test_count % test_rotor_circumference != test_rotor )) && continue
+	    set_message "R800 Extended Color 8 CMYKRB $a $b"
+	    if [ -n "$output" ] ; then
+		outstuff="$(printf '\n%s\n' \"output \\\""$output"/escp2-r800_"$b"_CMYKRB_"$a"_Color\\\";\")"
+	    fi
+	    print_one_testpattern "escp2-r800" "extended 8" "$b" CMYKRB "$a" Color "$extra" "$the_message" "$outstuff" | $print_command
+	    the_message=""
+	done
+    done
+}
+
+if [ -z "$dontrun" ] ; then
+    print_all_testpatterns | run_testpattern 2>&1
+else
+    print_all_testpatterns
+fi
+
+exit $?

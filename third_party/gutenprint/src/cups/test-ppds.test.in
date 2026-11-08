@@ -1,0 +1,130 @@
+#!@BASHREAL@
+
+# Test PPD conformance
+#
+# Copyright 2006-2017 Robert Krawitz (rlk@alum.mit.edu)
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation; either version 2 of the License, or (at your option)
+# any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+# or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+# for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+################################################################
+#                 TEST FOR PPD FILE COMPLIANCE
+#
+# Keeping this up to date with changing CUPS versions is a real headache.
+# This test, however, is particularly important; PPD conformance failures
+# are one of the most frequently observed problems, and a lot of apps
+# (and CUPS itself) are very sensitive -- arguably overly so -- to
+# violations of the spec.
+#
+# We can't skip the translated PPD files either; sometimes translations
+# blow out token maximum lengths.
+
+if [[ -n "$STP_TEST_LOG_PREFIX" ]] ; then
+    redir="${STP_TEST_LOG_PREFIX}${0##*/}_$$.log"
+    if [[ -n $BUILD_VERBOSE ]] ; then
+	exec > >(tee -a "$redir" >&3)
+    else
+	exec 1>>"$redir"
+    fi
+    exec 2>&1
+fi
+
+DEBUG=${STP_TEST_DEBUG:+echo}
+
+[[ -z $STP_TEST_SUITE || -z $STP_TEST_PROFILE ]] && STP_TEST_PROFILE=full
+
+[[ -n $STP_TEST_COMPONENTS && $STP_TEST_COMPONENTS != '*CUPS*' && $STP_TEST_COMPONENTS != '*test-ppds*' ]] && exit 77
+
+PPD_DIR=ppdtest
+
+PPD_PARALLEL=200
+
+echo '****************************************************************'
+
+rotor="-R ${STP_TEST_ROTOR_CIRCUMFERENCE:-1} -r ${STP_TEST_ROTOR:-0}"
+
+function test_full() {
+    rm -rf "$PPD_DIR"
+    echo "GENERATING PPD FILES (all):"
+    $DEBUG make "PPD_DIR=$PPD_DIR" EXTRA_GENPPD_OPTS="$rotor -b -Z" ppd-clean ppd-global-a ppd-nls-a ppd-nonls-a
+}
+
+function test_fast() {
+    rm -rf "$PPD_DIR"
+    echo "GENERATING PPD FILES (fast):"
+    $DEBUG make "PPD_DIR=$PPD_DIR" EXTRA_GENPPD_OPTS="$rotor -b -Z" ppd-clean ppd-nonls
+    if [[ -n $STP_TEST_DIST ]] ; then
+	echo "GENERATING PPD FILES (global):"
+	$DEBUG make "PPD_DIR=$PPD_DIR" EXTRA_GENPPD_OPTS="$rotor -b -Z -S" ppd-global
+    fi
+    PPD_PARALLEL=20
+}
+
+function test_minimal() {
+    rm -rf "$PPD_DIR"
+    echo "GENERATING PPD FILES (minimal):"
+    $DEBUG make "PPD_DIR=$PPD_DIR" EXTRA_GENPPD_OPTS="$rotor -b -Z -S" ppd-clean ppd-nonls
+    PPD_PARALLEL=20
+}
+
+case "$STP_TEST_PROFILE" in
+    full|fast|minimal)
+	test_$STP_TEST_PROFILE
+	;;
+    *)
+	exit 77
+esac
+
+if [[ -n "$STP_TEST_DEBUG" ]] ; then
+    echo "Would run $0 $*"
+    exit 0
+fi
+
+ppd_count=$(find "$PPD_DIR" -name '*.ppd' -print | wc -l)
+
+# Setting a limit on the number of files per invocation improves
+# performance by about a minute by reducing the tail at the end.
+[[ -n $STP_PARALLEL ]] && PARALLEL="-P $STP_PARALLEL -L $PPD_PARALLEL"
+
+# Most non-Macintosh systems won't have the Macintosh-specific profiles
+# installed in Macintosh-specific locations.
+#
+# Also, a number of our media sizes aren't named correctly, but we'll
+# accept those issues rather than cluttering the namespace further and/or
+# changing tag names.
+cupstestppdopts='-r -I profiles -W sizes -I filters'
+
+# This lets us report progress
+testcmd="echo -n . 1>&2; cupstestppd $cupstestppdopts"' "$@" |grep '"'FAIL$' | awk -F: '{print \$1}'"
+
+echo -n "TESTING PPD FILES: "
+failures="$(find $PPD_DIR -name '*.ppd*' -print | sort -t/ -k3 -k2 | xargs $PARALLEL sh -c "$testcmd")"
+echo 1>&2
+
+if [[ -z "$failures" ]] ; then
+    echo "All $ppd_count PPD files pass"
+    rm -rf $PPD_DIR
+    exit 0
+fi
+
+# Use this with "normal" PPD files without translated numbers.
+#echo $failures | xargs cupstestppd $cupstestppdopts 2>&1 | egrep -v 'Missing "[a-z][a-z](_[A-Z][A-Z])?" translation string for option Stp((Brightness|Contrast|Saturation), choice None|([a-zA-Z0-9]+, choice (-?[0-9]+)))!$' |egrep -v 'Missing cupsICCProfile file'
+
+# Use this with PPD files with translated numbers (genppd -N)
+# With normal globalized PPD files this will yield hundreds of megabytes
+# of errors.
+echo "$failures" | xargs -P $STP_PARALLEL -L 10 sh -c "cupstestppd -r $cupstestppdopts "'"$@"'" 2>&1 | egrep -v '(WARN.*(Size \".*\" should be \"|has unexpected dimensions|should be the Adobe standard name)|REF: Page.*|^$)'"
+
+fail_count=$(wc -l <<< "$failures")
+echo "$fail_count/$ppd_count fail"
+exit 1
