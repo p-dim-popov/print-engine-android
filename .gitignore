@@ -1,7 +1,3 @@
 # CMake host builds
 /build*/
-# Gradle output when an app builds android/
-/android/build/
-/android/.cxx/
-.gradle/
 __pycache__/

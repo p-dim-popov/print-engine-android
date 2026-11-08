@@ -122,15 +122,25 @@ decode_line(pwg_reader_t *r)
   return 0;
 }
 
+/* Makes the decoded line the next one of the page, decoding the next line
+   record once the current one has repeated its last time. */
+static int
+next_record(pwg_reader_t *r)
+{
+  if (r->repeat == 0 && decode_line(r) != 0)
+    return -1;
+  if (r->repeat > r->lines_left)
+    return fail(r, "a line repeats past the end of its page");
+  return 0;
+}
+
 int
 pwg_read_line(pwg_reader_t *r, unsigned char *line)
 {
   if (!r->in_page || r->lines_left == 0)
     return fail(r, "no line left on the page");
-  if (r->repeat == 0 && decode_line(r) != 0)
+  if (next_record(r) != 0)
     return -1;
-  if (r->repeat > r->lines_left)
-    return fail(r, "a line repeats past the end of its page");
   memcpy(line, r->decoded, r->line_bytes);
   r->repeat--;
   r->lines_left--;
@@ -197,10 +207,8 @@ pwg_next_page(pwg_reader_t *r, pwg_page_t *page)
     }
   while (r->in_page && r->lines_left > 0)
     {
-      if (r->repeat == 0 && decode_line(r) != 0)
+      if (next_record(r) != 0)
         return -1;
-      if (r->repeat > r->lines_left)
-        return fail(r, "a line repeats past the end of its page");
       r->lines_left -= r->repeat;
       r->repeat = 0;
     }

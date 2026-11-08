@@ -55,41 +55,102 @@ usage_error(const char *message, const char *detail)
 }
 
 static void
+report_bad_raster(const char *why)
+{
+  fprintf(stderr, "print-engine: bad raster: %s\n", why);
+}
+
+/* Out of memory ends the program as a driver failure. */
+static void *
+checked(void *allocated)
+{
+  if (!allocated)
+    {
+      fputs("print-engine: out of memory\n", stderr);
+      exit(EXIT_DRIVER_FAILED);
+    }
+  return allocated;
+}
+
+static void
 write_stderr(void *data, const char *buffer, size_t bytes)
 {
   (void)data;
   fwrite(buffer, 1, bytes, stderr);
 }
 
-/* ---- The driver's choices ---------------------------------------------- */
+/* ---- Resolutions and colour modes --------------------------------------- */
 
 typedef struct
 {
-  char *paper;          /* Gutenprint PageSize name */
-  char pwg[128];        /* its PWG media name */
-} paper_t;
+  int x, y;             /* dpi; 0 when not known or not chosen */
+} resolution_t;
 
-typedef struct
+static int
+resolution_known(resolution_t r)
 {
-  const char *name;     /* Gutenprint Resolution choice, NULL for none */
-  int x_dpi, y_dpi;
-  int color, mono;      /* PrintingMode offers Color, BW */
-} mode_t_;
+  return r.x > 0 && r.y > 0;
+}
 
-typedef struct
+static int
+resolution_equal(resolution_t a, resolution_t b)
 {
-  const stp_printer_t *printer;
-  stp_vars_t *defaults;
-  paper_t *papers;
-  size_t paper_count;
-  const char *default_paper;
-  mode_t_ *modes;
-  size_t mode_count;
-  stp_parameter_t resolutions;   /* owns the mode names */
-  int has_resolutions;
-  int default_x_dpi, default_y_dpi;
-  int default_color;             /* 1 Color, 0 BW */
-} driver_t;
+  return a.x == b.x && a.y == b.y;
+}
+
+/* `600dpi`, or `720x360dpi` when the directions differ. */
+static void
+format_resolution(char *out, size_t size, resolution_t r)
+{
+  if (r.x == r.y)
+    snprintf(out, size, "%ddpi", r.x);
+  else
+    snprintf(out, size, "%dx%ddpi", r.x, r.y);
+}
+
+/* `600dpi`, `600x600dpi` or `600`: 0, or -1 for anything else. */
+static int
+parse_resolution(const char *value, resolution_t *r)
+{
+  char *end;
+  long x = strtol(value, &end, 10);
+  long y = x;
+  if (end == value || x <= 0 || x > 100000)
+    return -1;
+  if (*end == 'x')
+    {
+      const char *start = end + 1;
+      y = strtol(start, &end, 10);
+      if (end == start || y <= 0 || y > 100000)
+        return -1;
+    }
+  if (*end != '\0' && strcmp(end, "dpi") != 0)
+    return -1;
+  r->x = (int)x;
+  r->y = (int)y;
+  return 0;
+}
+
+/* Colour modes, as bits so that a print mode can offer both. */
+typedef enum
+{
+  COLOR_MODE_ANY = 0,
+  COLOR_MODE_COLOR = 1,
+  COLOR_MODE_MONOCHROME = 2
+} color_mode_t;
+
+static const char *
+color_mode_keyword(color_mode_t mode)
+{
+  return mode == COLOR_MODE_MONOCHROME ? "monochrome" : "color";
+}
+
+/* Gutenprint's PrintingMode value. */
+static const char *
+color_mode_printing_mode(color_mode_t mode)
+{
+  return mode == COLOR_MODE_MONOCHROME ? "BW" : "Color";
+}
 
 static int
 string_list_has(const stp_string_list_t *list, const char *name)
@@ -97,18 +158,58 @@ string_list_has(const stp_string_list_t *list, const char *name)
   return list && name && stp_string_list_is_present(list, name);
 }
 
-static void
-printing_modes(const stp_vars_t *v, int *color, int *mono)
+/* The colour modes the driver offers with the settings v. */
+static unsigned
+offered_color_modes(const stp_vars_t *v)
 {
   stp_parameter_t desc;
   stp_describe_parameter(v, "PrintingMode", &desc);
-  *color = desc.p_type == STP_PARAMETER_TYPE_STRING_LIST && string_list_has(desc.bounds.str, "Color");
-  *mono = desc.p_type == STP_PARAMETER_TYPE_STRING_LIST && string_list_has(desc.bounds.str, "BW");
+  unsigned modes = 0;
+  if (desc.p_type == STP_PARAMETER_TYPE_STRING_LIST)
+    {
+      if (string_list_has(desc.bounds.str, "Color"))
+        modes |= COLOR_MODE_COLOR;
+      if (string_list_has(desc.bounds.str, "BW"))
+        modes |= COLOR_MODE_MONOCHROME;
+    }
   stp_parameter_description_destroy(&desc);
+  return modes;
 }
 
+/* ---- The driver's choices ----------------------------------------------- */
+
+typedef struct
+{
+  char *name;           /* Gutenprint PageSize name */
+  char pwg[128];        /* its PWG media name */
+  double width, height; /* points */
+} paper_t;
+
+/* One of Gutenprint's print modes: a choice of its Resolution parameter. */
+typedef struct
+{
+  const char *name;     /* NULL: the driver has no such choices */
+  resolution_t resolution;
+  unsigned color_modes;
+} print_mode_t;
+
+typedef struct
+{
+  const stp_printer_t *printer;
+  stp_vars_t *defaults;
+  paper_t *papers;
+  size_t paper_count;
+  const paper_t *default_paper;
+  print_mode_t *modes;
+  size_t mode_count;
+  stp_parameter_t resolutions;   /* owns the mode names */
+  const char *default_mode;      /* NULL when the driver names none */
+  resolution_t default_resolution;
+  color_mode_t default_color_mode;
+} driver_t;
+
 static const paper_t *
-paper_by_pwg(const driver_t *d, const char *pwg)
+paper_named(const driver_t *d, const char *pwg)
 {
   for (size_t i = 0; i < d->paper_count; i++)
     if (strcmp(d->papers[i].pwg, pwg) == 0)
@@ -116,13 +217,12 @@ paper_by_pwg(const driver_t *d, const char *pwg)
   return NULL;
 }
 
-static const paper_t *
-paper_by_name(const driver_t *d, const char *name)
+static void
+paper_pwg_name(const char *name, const stp_papersize_t *size, char *out, size_t out_size)
 {
-  for (size_t i = 0; i < d->paper_count; i++)
-    if (strcmp(d->papers[i].paper, name) == 0)
-      return &d->papers[i];
-  return NULL;
+  int metric = size->paper_unit == PAPERSIZE_METRIC_STANDARD
+    || size->paper_unit == PAPERSIZE_METRIC_EXTENDED;
+  pwg_media_name(name, size->width, size->height, metric, out, out_size);
 }
 
 static void
@@ -132,7 +232,7 @@ load_papers(driver_t *d)
   stp_describe_parameter(d->defaults, "PageSize", &desc);
   size_t count = desc.p_type == STP_PARAMETER_TYPE_STRING_LIST && desc.bounds.str
     ? stp_string_list_count(desc.bounds.str) : 0;
-  d->papers = calloc(count ? count : 1, sizeof *d->papers);
+  d->papers = checked(calloc(count ? count : 1, sizeof *d->papers));
   for (size_t i = 0; i < count; i++)
     {
       const char *name = stp_string_list_param(desc.bounds.str, i)->name;
@@ -140,22 +240,27 @@ load_papers(driver_t *d)
       /* Custom sizes and rolls have no fixed size: skip them. */
       if (!size || size->width <= 0 || size->height <= 0)
         continue;
-      int metric = size->paper_unit == PAPERSIZE_METRIC_STANDARD
-        || size->paper_unit == PAPERSIZE_METRIC_EXTENDED;
-      paper_t paper;
-      pwg_media_name(name, size->width, size->height, metric, paper.pwg, sizeof paper.pwg);
+      paper_t paper = { .width = size->width, .height = size->height };
+      paper_pwg_name(name, size, paper.pwg, sizeof paper.pwg);
       /* Papers of one size share a name; the first of them stands for it. */
-      if (paper_by_pwg(d, paper.pwg))
+      if (paper_named(d, paper.pwg))
         continue;
-      paper.paper = strdup(name);
+      paper.name = checked(strdup(name));
       d->papers[d->paper_count++] = paper;
     }
-  const char *deflt = desc.deflt.str;
+
+  /* The default paper, or the one that stands for its size. */
+  const stp_papersize_t *size = desc.deflt.str
+    ? stp_describe_papersize(d->defaults, desc.deflt.str) : NULL;
   d->default_paper = NULL;
-  if (deflt && paper_by_name(d, deflt))
-    d->default_paper = paper_by_name(d, deflt)->pwg;
-  else if (d->paper_count > 0)
-    d->default_paper = d->papers[0].pwg;
+  if (size && size->width > 0 && size->height > 0)
+    {
+      char pwg[128];
+      paper_pwg_name(desc.deflt.str, size, pwg, sizeof pwg);
+      d->default_paper = paper_named(d, pwg);
+    }
+  if (!d->default_paper && d->paper_count > 0)
+    d->default_paper = &d->papers[0];
   stp_parameter_description_destroy(&desc);
 }
 
@@ -164,38 +269,42 @@ load_modes(driver_t *d)
 {
   stp_describe_parameter(d->defaults, "Resolution", &d->resolutions);
   size_t count = 0;
-  d->has_resolutions = d->resolutions.p_type == STP_PARAMETER_TYPE_STRING_LIST
-    && d->resolutions.is_active && d->resolutions.bounds.str
-    && (count = stp_string_list_count(d->resolutions.bounds.str)) > 0;
-  if (!d->has_resolutions)
-    count = 0;
-  d->modes = calloc(count ? count : 1, sizeof *d->modes);
+  if (d->resolutions.p_type == STP_PARAMETER_TYPE_STRING_LIST && d->resolutions.is_active
+      && d->resolutions.bounds.str)
+    count = stp_string_list_count(d->resolutions.bounds.str);
+  d->modes = checked(calloc(count ? count : 1, sizeof *d->modes));
   for (size_t i = 0; i < count; i++)
     {
-      mode_t_ *m = &d->modes[d->mode_count];
+      print_mode_t *m = &d->modes[d->mode_count];
       m->name = stp_string_list_param(d->resolutions.bounds.str, i)->name;
       stp_vars_t *v = stp_vars_create_copy(d->defaults);
       stp_set_string_parameter(v, "Resolution", m->name);
-      stp_describe_resolution(v, &m->x_dpi, &m->y_dpi);
-      printing_modes(v, &m->color, &m->mono);
+      stp_describe_resolution(v, &m->resolution.x, &m->resolution.y);
+      m->color_modes = offered_color_modes(v);
       stp_vars_destroy(v);
-      if (m->x_dpi > 0 && m->y_dpi > 0)
+      /* "None" and the like: no resolution of their own. */
+      if (resolution_known(m->resolution))
         d->mode_count++;
     }
-  if (d->mode_count == 0)
+  if (d->mode_count > 0)
+    d->default_mode = d->resolutions.deflt.str;
+  else
     {
       /* One mode: the driver's own choice. */
-      d->has_resolutions = 0;
-      mode_t_ *m = &d->modes[0];
+      print_mode_t *m = &d->modes[0];
       m->name = NULL;
-      stp_describe_resolution(d->defaults, &m->x_dpi, &m->y_dpi);
-      printing_modes(d->defaults, &m->color, &m->mono);
+      stp_describe_resolution(d->defaults, &m->resolution.x, &m->resolution.y);
+      m->color_modes = offered_color_modes(d->defaults);
       d->mode_count = 1;
     }
-  stp_describe_resolution(d->defaults, &d->default_x_dpi, &d->default_y_dpi);
+
+  stp_describe_resolution(d->defaults, &d->default_resolution.x, &d->default_resolution.y);
   stp_parameter_t desc;
   stp_describe_parameter(d->defaults, "PrintingMode", &desc);
-  d->default_color = !(desc.deflt.str && strcmp(desc.deflt.str, "BW") == 0);
+  d->default_color_mode = COLOR_MODE_ANY;
+  if (desc.p_type == STP_PARAMETER_TYPE_STRING_LIST && desc.deflt.str)
+    d->default_color_mode = strcmp(desc.deflt.str, "BW") == 0
+      ? COLOR_MODE_MONOCHROME : COLOR_MODE_COLOR;
   stp_parameter_description_destroy(&desc);
 }
 
@@ -218,20 +327,73 @@ static void
 free_driver(driver_t *d)
 {
   for (size_t i = 0; i < d->paper_count; i++)
-    free(d->papers[i].paper);
+    free(d->papers[i].name);
   free(d->papers);
   free(d->modes);
   stp_parameter_description_destroy(&d->resolutions);
   stp_vars_destroy(d->defaults);
 }
 
-static void
-format_resolution(char *out, size_t size, int x, int y)
+static unsigned
+all_color_modes(const driver_t *d)
 {
-  if (x == y)
-    snprintf(out, size, "%ddpi", x);
-  else
-    snprintf(out, size, "%dx%ddpi", x, y);
+  unsigned modes = 0;
+  for (size_t i = 0; i < d->mode_count; i++)
+    modes |= d->modes[i].color_modes;
+  return modes;
+}
+
+static int
+lists_resolution(const driver_t *d, resolution_t r)
+{
+  for (size_t i = 0; i < d->mode_count; i++)
+    if (resolution_equal(d->modes[i].resolution, r))
+      return 1;
+  return 0;
+}
+
+static int
+is_default_mode(const driver_t *d, const print_mode_t *m)
+{
+  return d->default_mode && m->name && strcmp(m->name, d->default_mode) == 0;
+}
+
+static int
+mode_fits(const print_mode_t *m, resolution_t r, color_mode_t color)
+{
+  return (!resolution_known(r) || resolution_equal(m->resolution, r))
+    && (color == COLOR_MODE_ANY || (m->color_modes & color));
+}
+
+/* The print mode for a resolution and a colour mode, each of which the
+   driver lists (or ANY / unknown): the driver's default mode if it has
+   both, else the first mode that has both, else the mode with the colour
+   mode whose resolution is nearest. */
+static const print_mode_t *
+choose_mode(const driver_t *d, resolution_t r, color_mode_t color)
+{
+  for (size_t i = 0; i < d->mode_count; i++)
+    if (is_default_mode(d, &d->modes[i]) && mode_fits(&d->modes[i], r, color))
+      return &d->modes[i];
+  for (size_t i = 0; i < d->mode_count; i++)
+    if (mode_fits(&d->modes[i], r, color))
+      return &d->modes[i];
+  const print_mode_t *nearest = NULL;
+  long nearest_distance = 0;
+  for (size_t i = 0; i < d->mode_count; i++)
+    {
+      const print_mode_t *m = &d->modes[i];
+      if (!mode_fits(m, (resolution_t){ 0, 0 }, color))
+        continue;
+      long distance = labs((long)m->resolution.x - r.x) + labs((long)m->resolution.y - r.y);
+      if (!nearest || distance < nearest_distance
+          || (distance == nearest_distance && is_default_mode(d, m) && !is_default_mode(d, nearest)))
+        {
+          nearest = m;
+          nearest_distance = distance;
+        }
+    }
+  return nearest;
 }
 
 /* ---- describe ------------------------------------------------------------ */
@@ -244,38 +406,33 @@ describe(const driver_t *d)
   for (size_t i = 0; i < d->paper_count; i++)
     printf("media=%s\n", d->papers[i].pwg);
   if (d->default_paper)
-    printf("media-default=%s\n", d->default_paper);
+    printf("media-default=%s\n", d->default_paper->pwg);
 
   char text[64];
   for (size_t i = 0; i < d->mode_count; i++)
     {
-      if (d->modes[i].x_dpi <= 0 || d->modes[i].y_dpi <= 0)
-        continue;   /* a driver that does not know its resolution */
+      resolution_t r = d->modes[i].resolution;
       int seen = 0;
       for (size_t j = 0; j < i; j++)
-        seen |= d->modes[j].x_dpi == d->modes[i].x_dpi && d->modes[j].y_dpi == d->modes[i].y_dpi;
-      if (seen)
+        seen |= resolution_equal(d->modes[j].resolution, r);
+      if (seen || !resolution_known(r))
         continue;
-      format_resolution(text, sizeof text, d->modes[i].x_dpi, d->modes[i].y_dpi);
+      format_resolution(text, sizeof text, r);
       printf("resolution=%s\n", text);
     }
-  if (d->default_x_dpi > 0 && d->default_y_dpi > 0)
+  if (resolution_known(d->default_resolution) && lists_resolution(d, d->default_resolution))
     {
-      format_resolution(text, sizeof text, d->default_x_dpi, d->default_y_dpi);
+      format_resolution(text, sizeof text, d->default_resolution);
       printf("resolution-default=%s\n", text);
     }
 
-  int color = 0, mono = 0;
-  for (size_t i = 0; i < d->mode_count; i++)
-    {
-      color |= d->modes[i].color;
-      mono |= d->modes[i].mono;
-    }
-  if (color)
+  unsigned colors = all_color_modes(d);
+  if (colors & COLOR_MODE_COLOR)
     printf("color-mode=color\n");
-  if (mono)
+  if (colors & COLOR_MODE_MONOCHROME)
     printf("color-mode=monochrome\n");
-  printf("color-mode-default=%s\n", d->default_color ? "color" : "monochrome");
+  if (colors & d->default_color_mode)
+    printf("color-mode-default=%s\n", color_mode_keyword(d->default_color_mode));
   fflush(stdout);
   return ferror(stdout) ? EXIT_DRIVER_FAILED : 0;
 }
@@ -284,64 +441,15 @@ describe(const driver_t *d)
 
 typedef struct
 {
-  const paper_t *paper;   /* NULL: from each page, else the default */
-  const mode_t_ *mode;
-  const char *printing_mode;  /* "Color", "BW" or NULL for the default */
+  const paper_t *paper;       /* NULL: from each page */
+  const print_mode_t *mode;
+  color_mode_t color_mode;    /* ANY: the driver's default */
 } settings_t;
-
-static int
-parse_resolution(const char *value, int *x, int *y)
-{
-  char *end;
-  long a = strtol(value, &end, 10);
-  long b = a;
-  if (end == value || a <= 0 || a > 100000)
-    return -1;
-  if (*end == 'x')
-    {
-      const char *start = end + 1;
-      b = strtol(start, &end, 10);
-      if (end == start || b <= 0 || b > 100000)
-        return -1;
-    }
-  if (*end != '\0' && strcmp(end, "dpi") != 0)
-    return -1;
-  *x = (int)a;
-  *y = (int)b;
-  return 0;
-}
-
-static int
-mode_fits(const mode_t_ *m, int x, int y, const char *printing_mode)
-{
-  if (x && (m->x_dpi != x || m->y_dpi != y))
-    return 0;
-  if (printing_mode && strcmp(printing_mode, "BW") == 0 && !m->mono)
-    return 0;
-  if (printing_mode && strcmp(printing_mode, "Color") == 0 && !m->color)
-    return 0;
-  return 1;
-}
-
-/* The driver's default mode if it fits, else the first one that does. */
-static const mode_t_ *
-choose_mode(const driver_t *d, int x, int y, const char *printing_mode)
-{
-  const char *deflt = d->has_resolutions ? d->resolutions.deflt.str : NULL;
-  for (size_t i = 0; i < d->mode_count; i++)
-    if (deflt && d->modes[i].name && strcmp(d->modes[i].name, deflt) == 0
-        && mode_fits(&d->modes[i], x, y, printing_mode))
-      return &d->modes[i];
-  for (size_t i = 0; i < d->mode_count; i++)
-    if (mode_fits(&d->modes[i], x, y, printing_mode))
-      return &d->modes[i];
-  return NULL;
-}
 
 static int
 parse_options(const driver_t *d, char **options, int count, settings_t *s)
 {
-  int x = 0, y = 0;
+  resolution_t resolution = { 0, 0 };
   memset(s, 0, sizeof *s);
   for (int i = 0; i < count; i++)
     {
@@ -353,30 +461,34 @@ parse_options(const driver_t *d, char **options, int count, settings_t *s)
       size_t key_length = (size_t)(eq - option);
       if (key_length == 5 && strncmp(option, "media", 5) == 0)
         {
-          s->paper = paper_by_pwg(d, value);
+          s->paper = paper_named(d, value);
           if (!s->paper)
             return usage_error("the driver has no paper ", value);
         }
       else if (key_length == 10 && strncmp(option, "resolution", 10) == 0)
         {
-          if (parse_resolution(value, &x, &y) != 0)
+          if (parse_resolution(value, &resolution) != 0)
             return usage_error("a resolution is Ndpi or XxYdpi, not ", value);
+          if (!lists_resolution(d, resolution))
+            return usage_error("the driver has no resolution ", value);
         }
       else if (key_length == 10 && strncmp(option, "color-mode", 10) == 0)
         {
           if (strcmp(value, "color") == 0)
-            s->printing_mode = "Color";
+            s->color_mode = COLOR_MODE_COLOR;
           else if (strcmp(value, "monochrome") == 0)
-            s->printing_mode = "BW";
+            s->color_mode = COLOR_MODE_MONOCHROME;
           else
             return usage_error("color-mode is color or monochrome, not ", value);
+          if (!(all_color_modes(d) & s->color_mode))
+            return usage_error("the driver has no colour mode ", value);
         }
       else
         return usage_error("unknown option ", option);
     }
-  s->mode = choose_mode(d, x, y, s->printing_mode);
+  s->mode = choose_mode(d, resolution, s->color_mode);
   if (!s->mode)
-    return usage_error("the driver offers no such resolution and colour mode", NULL);
+    return usage_error("the driver offers no print mode for these options", NULL);
   return 0;
 }
 
@@ -443,7 +555,7 @@ image_get_row(stp_image_t *image, unsigned char *data, size_t byte_limit, int ro
       if (pwg_read_line(job->reader, job->line) != 0)
         {
           job->raster_failed = 1;
-          fprintf(stderr, "print-engine: bad raster: %s\n", pwg_reader_error(job->reader));
+          report_bad_raster(pwg_reader_error(job->reader));
           return STP_IMAGE_STATUS_ABORT;
         }
       job->next_line++;
@@ -470,16 +582,13 @@ page_paper(const driver_t *d, const settings_t *s, const pwg_page_t *page)
 {
   if (s->paper)
     return s->paper;
-  if (page->media_name[0] && paper_by_pwg(d, page->media_name))
-    return paper_by_pwg(d, page->media_name);
+  if (page->media_name[0] && paper_named(d, page->media_name))
+    return paper_named(d, page->media_name);
   for (size_t i = 0; i < d->paper_count; i++)
-    {
-      const stp_papersize_t *size = stp_describe_papersize(d->defaults, d->papers[i].paper);
-      if (size && fabs(size->width - page->page_width) <= 1
-          && fabs(size->height - page->page_height) <= 1)
-        return &d->papers[i];
-    }
-  return d->default_paper ? paper_by_pwg(d, d->default_paper) : NULL;
+    if (fabs(d->papers[i].width - page->page_width) <= 1
+        && fabs(d->papers[i].height - page->page_height) <= 1)
+      return &d->papers[i];
+  return d->default_paper;
 }
 
 /* Clears string settings the driver no longer offers after the others
@@ -522,16 +631,15 @@ page_vars(const driver_t *d, const settings_t *s, job_t *job, int number)
   stp_set_float_parameter(v, "AppGamma", 1.0);
   if (s->mode->name)
     stp_set_string_parameter(v, "Resolution", s->mode->name);
-  if (s->printing_mode)
-    stp_set_string_parameter(v, "PrintingMode", s->printing_mode);
+  if (s->color_mode != COLOR_MODE_ANY)
+    stp_set_string_parameter(v, "PrintingMode", color_mode_printing_mode(s->color_mode));
 
   const paper_t *paper = page_paper(d, s, page);
   if (paper)
     {
-      stp_set_string_parameter(v, "PageSize", paper->paper);
-      const stp_papersize_t *size = stp_describe_papersize(v, paper->paper);
-      stp_set_page_width(v, size->width);
-      stp_set_page_height(v, size->height);
+      stp_set_string_parameter(v, "PageSize", paper->name);
+      stp_set_page_width(v, paper->width);
+      stp_set_page_height(v, paper->height);
     }
   validate(v);
   stp_merge_printvars(v, stp_printer_get_defaults(d->printer));
@@ -557,9 +665,7 @@ print_job(const driver_t *d, const settings_t *s)
 {
   job_t job;
   memset(&job, 0, sizeof job);
-  job.reader = pwg_reader_open(stdin);
-  if (!job.reader)
-    return EXIT_DRIVER_FAILED;
+  job.reader = checked(pwg_reader_open(stdin));
   stp_image_t image = {
     .width = image_width,
     .height = image_height,
@@ -568,42 +674,33 @@ print_job(const driver_t *d, const settings_t *s)
     .rep = &job,
   };
 
-  int status = 0;
   int got = pwg_next_page(job.reader, &job.page);
   if (got <= 0)
     {
-      fprintf(stderr, "print-engine: bad raster: %s\n",
-              got == 0 ? "the input has no page" : pwg_reader_error(job.reader));
+      report_bad_raster(got == 0 ? "the input has no page" : pwg_reader_error(job.reader));
       pwg_reader_close(job.reader);
       return EXIT_BAD_RASTER;
     }
 
-  stp_vars_t *v = NULL;
-  int started = 0;
-  for (int number = 0; got > 0; number++)
+  int status = 0;
+  stp_vars_t *sent = NULL;   /* the settings of the last page the driver took */
+  for (int number = 0; got > 0 && !status; number++)
     {
-      if (v)
-        stp_vars_destroy(v);
-      unsigned char *line = realloc(job.line, (size_t)job.page.width * job.page.channels);
-      if (!line)
-        {
-          status = EXIT_DRIVER_FAILED;
-          break;
-        }
-      job.line = line;
-      v = page_vars(d, s, &job, number);
+      job.line = checked(realloc(job.line, (size_t)job.page.width * job.page.channels));
+      stp_vars_t *v = page_vars(d, s, &job, number);
       if (job.width <= 0 || job.height <= 0 || !stp_verify(v))
         {
           fprintf(stderr, "print-engine: the driver refused the settings of page %d\n", number + 1);
+          stp_vars_destroy(v);
           status = EXIT_DRIVER_FAILED;
           break;
         }
-      if (!started)
-        {
-          stp_start_job(v, &image);
-          started = 1;
-        }
-      int printed = stp_print(v, &image);
+      if (sent)
+        stp_vars_destroy(sent);
+      sent = v;
+      if (number == 0)
+        stp_start_job(sent, &image);
+      int printed = stp_print(sent, &image);
       if (job.raster_failed)
         status = EXIT_BAD_RASTER;
       else if (job.write_failed)
@@ -613,21 +710,19 @@ print_job(const driver_t *d, const settings_t *s)
           fprintf(stderr, "print-engine: the driver failed on page %d\n", number + 1);
           status = EXIT_DRIVER_FAILED;
         }
-      if (status)
-        break;
-      got = pwg_next_page(job.reader, &job.page);
-      if (got < 0)
+      else if ((got = pwg_next_page(job.reader, &job.page)) < 0)
         {
-          fprintf(stderr, "print-engine: bad raster: %s\n", pwg_reader_error(job.reader));
+          report_bad_raster(pwg_reader_error(job.reader));
           status = EXIT_BAD_RASTER;
         }
     }
   /* A job once started is always ended, so the printer is not left
      waiting in the middle of it. */
-  if (started)
-    stp_end_job(v, &image);
-  if (v)
-    stp_vars_destroy(v);
+  if (sent)
+    {
+      stp_end_job(sent, &image);
+      stp_vars_destroy(sent);
+    }
   if (fflush(stdout) != 0 || ferror(stdout))
     {
       if (!job.write_failed)
@@ -661,7 +756,7 @@ main(int argc, char **argv)
     return usage_error("unknown command ", command);
 
   const char *driver_name = NULL;
-  char **options = calloc((size_t)argc, sizeof *options);
+  char **options = checked(calloc((size_t)argc, sizeof *options));
   int option_count = 0;
   for (int i = 2; i < argc; i++)
     {

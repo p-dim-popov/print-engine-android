@@ -246,8 +246,10 @@ static const char *const standard_names[] = {
    standard size matches a paper within a millimetre. */
 #define TOLERANCE (POINTS_PER_INCH / MM_PER_INCH)
 
-int
-pwg_media_size(const char *name, double *width, double *height, int *metric)
+/* The size a self-describing PWG media name states, in points, and
+   whether it is given in millimetres: 0, or -1 when the name states none. */
+static int
+media_size(const char *name, double *width, double *height, int *metric)
 {
   const char *size = strrchr(name, '_');
   if (!size || size == name)
@@ -307,7 +309,7 @@ pwg_media_name(const char *paper, double width, double height, int metric,
     {
       double w, h;
       int m;
-      if (pwg_media_size(standard_names[i], &w, &h, &m) != 0)
+      if (media_size(standard_names[i], &w, &h, &m) != 0)
         continue;
       double error = fmax(fabs(w - width), fabs(h - height));
       if (error > TOLERANCE)

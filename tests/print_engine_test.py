@@ -288,6 +288,21 @@ class Options(unittest.TestCase):
         # pwg.a4 names iso_a4_210x297mm in the page header; the default is Letter.
         self.assertEqual(self.job(), self.job("media=" + A4))
 
+    def test_every_listed_resolution_prints_in_every_listed_colour_mode(self):
+        # The MP250's 1200 dpi modes are colour only; monochrome then prints
+        # at the nearest resolution that has it.
+        pairs = describe(MP250)
+        for resolution in values(pairs, "resolution"):
+            for mode in values(pairs, "color-mode"):
+                with self.subTest(resolution=resolution, mode=mode):
+                    self.job("media=" + A4, "resolution=" + resolution, "color-mode=" + mode)
+        self.assertEqual(self.job("resolution=1200dpi", "color-mode=monochrome"),
+                         self.job("resolution=600dpi", "color-mode=monochrome"))
+
+    def test_a_resolution_the_driver_does_not_list_is_a_usage_error(self):
+        result = print_job(MP250, self.page, "resolution=450dpi")
+        self.assertEqual(result.returncode, USAGE)
+
     def test_color_mode_selects_the_printing_mode(self):
         self.assertNotEqual(self.job("color-mode=monochrome"), self.job("color-mode=color"))
 

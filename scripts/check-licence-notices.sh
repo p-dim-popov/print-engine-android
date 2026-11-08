@@ -7,9 +7,10 @@
 # Usage: check-licence-notices.sh [REPO_DIR]
 #
 # Every source, build or test file outside third_party/ carries a GPL
-# notice: the full GPL-2.0-or-later notice in C files, the one-line
-# "GPL-2.0-or-later" notice in scripts and build files. That includes new
-# files not yet added to git; git-ignored build output is skipped.
+# notice: a file passes when it names "GPL-2.0-or-later" (the one-line
+# notice of scripts and build files) or "GNU General Public License" (the
+# full notice of C files). That includes new files not yet added to git;
+# git-ignored build output is skipped.
 # third_party/ keeps upstream's own notices.
 set -euo pipefail
 
