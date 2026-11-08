@@ -1,0 +1,1197 @@
+#!@PERL@
+
+# Featureful driver for test pattern generator
+#
+# Copyright 2006-2017 Robert Krawitz (rlk@alum.mit.edu) and other
+# members of the Gutenprint project.
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation; either version 2 of the License, or (at your option)
+# any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+# or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+# for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+use Getopt::Long;
+Getopt::Long::Configure("bundling", "no_ignore_case", "pass_through");
+
+use strict;
+use POSIX ":sys_wait_h";
+
+my $valgrind = 0;
+my $callgrind = 0;
+my $gdb_attach = 0;
+my $compress_checksums = 0;
+my $csum_file = undef;
+my $csum_dir = undef;
+my $csum_type = 'sha512';
+my $dontrun = 0;
+my $retval = 0;
+my $halt_on_error = 0;
+my $testpattern_command;
+my @printer_list = ();
+my @exclude_list = ();
+my @include_patterns = ();
+my @exclude_patterns = ();
+my @special_options = ();
+my $include_pattern = '';
+my $exclude_pattern = '';
+my %exclude_list = ();
+my @standard_options = ("InkType",
+			"Resolution",
+			"InkSet,RawChannels",
+			"DitherAlgorithm",
+			"Duplex",
+			"MediaType",
+			"InputSlot",
+			"ColorCorrection",
+			"TPMode",
+			"ImageType",
+			"FullBleed",
+			"Quality",
+			"UseGloss",
+			"Weave",
+			"PrintingDirection",
+			"Density",
+			"CyanDensity",
+			"Orientation",
+			"LabelSeparator");
+my @tp_modes = ("cmyk8",
+		"cmyk16",
+		"kcmy8",
+		"kcmy16",
+		"rgb8",
+		"rgb16",
+		"cmy8",
+		"cmy16",
+		"gray8",
+		"gray16",
+		"white8",
+		"white16");
+my $global_status = 1;
+my $run_installed = 0;
+my $use_min_res = 0;
+my $use_min_pagesize = 0;
+my $help = 0;
+my $output = undef;
+my $hsize = 0.1;
+my $vsize = 0.1;
+my $left = 0.15;
+my $top = 0.15;
+my $geometry = "";
+my $restart = 1;
+my $global_fh;
+my $error = 0;
+my $global_printer;
+my $global_messages;
+my $global_page;
+my $global_case;
+
+my @extras = ();
+my @job_extras = ();
+my @messages = ();
+my @global_messages = ();
+my @families = ();
+my %stpdata = ();
+my %resolutions = ();
+my %models_found = ();
+my %models;
+my %families;
+my %defaults;
+my $skip_duplicate_printers = 0;
+my $std_pages = 1;
+my $duplex_pages = 4;
+my $skip_resolutions = 0;
+my $quiet = 0;
+my $single = 0;
+my $rerun = 0;
+my $list_printers = 0;
+my $list_options = 0;
+my $verbose = 0;
+my $use_unused_options = 0;
+my $proc_count = 1;
+my $round = 0;
+my $print_family = 0;
+my $res_limit = 0;
+my $proc_rotor = 0;
+my $case_no = -1;
+my $vg = "libtool --mode=execute valgrind";
+
+my @default_options = ();
+my %base_settings = ("DitherAlgorithm" => "Fast");
+
+my %param_types;
+my %stp_dimension_values;
+my %stp_float_values;
+my %stp_int_values;
+my %min_page_size;
+my %max_page_size;
+my %stp_bools;
+my %rerun_cases;
+my $stp_test_rotor=0;
+my $stp_test_rotor_circumference=1;
+
+if (defined $ENV{"STP_PARALLEL"}) {
+    $proc_count = $ENV{"STP_PARALLEL"};
+    if ($proc_count < 1) {
+	$proc_count = 1;
+    } elsif ($proc_count > 1) {
+	$quiet = 1;
+    }
+}
+if (defined $ENV{"STP_TEST_ROTOR"} && defined $ENV{"STP_TEST_ROTOR_CIRCUMFERENCE"}) {
+    $stp_test_rotor=$ENV{"STP_TEST_ROTOR"};
+    $stp_test_rotor_circumference=$ENV{"STP_TEST_ROTOR_CIRCUMFERENCE"};
+}
+
+
+if (defined $ENV{"STP_TEST_FAMILY"}) {
+   @families = split(/ +/, $ENV{"STP_TEST_FAMILY"});
+}
+
+GetOptions("C=s" => \$csum_type,
+	   "F"   => \$print_family,
+	   "G=s" => \$geometry,
+	   "H!"  => \$halt_on_error,
+	   "L"   => \$list_options,
+	   "M:s" => \$csum_file,
+	   "O=s" => \$output,
+	   "P:i" => \$duplex_pages,
+	   "R+"  => \$use_min_res,
+	   "S+"  => \$single,
+	   "T:i" => \$res_limit,
+	   "V+"  => \$verbose,
+	   "X"   => \$rerun,
+	   "Y=s" => \@include_patterns,
+	   "c"   => \$callgrind,
+	   "d=s" => \@default_options,
+	   "f=s" => \@families,
+	   "g"   => \$gdb_attach,
+	   "h"   => \$help,
+	   "i!"  => \$run_installed,
+	   "l"   => \$list_printers,
+	   "m:s" => \$csum_dir,
+	   "n"   => \$dontrun,
+	   "o=s" => \@special_options,
+	   "p:i" => \$std_pages,
+	   "q+"  => \$quiet,
+	   "r!"  => \$skip_resolutions,
+	   "s!"  => \$skip_duplicate_printers,
+	   "N!"  => \$use_unused_options,
+	   "v+"  => \$valgrind,
+	   "x=s" => \@exclude_list,
+	   "y=s" => \@exclude_patterns,
+	   "u"   => \$round,
+	   "t:i" => \$proc_count);
+
+sub print_help_and_exit() {
+    my $options = join("\n                        ", sort @standard_options);
+    print STDERR <<EOF;
+Usage: run-testpattern-2 [opts] [model ...]
+
+  Printer selection options:
+    -f family       Test printers only in the specified family.  Multiple
+                    families may be tested.  By default, all printer families
+                    are tested.
+    -s              Skip duplicate printers (with the same model number
+                    in printers.xml).
+    -x printer      Do not test the specified printer.
+    -y pattern      Do not test printers matching the specified pattern(s).
+    -Y pattern      Only test printers matching the specified pattern(s).
+
+  Logging options:
+    -C csum_type    Generate specified checksum type (default $csum_type).  Options:
+                    - md5
+                    - sha
+                    - sha1
+                    - sha224
+                    - ssh256
+                    - sha384
+                    - sha512
+    -m csum_dir     Generate checksums and place them in the specified
+                    directory, one file per run.  Directory will be created
+                    if necessary.
+    -M csum_file    Generate checksums and place them in the specified
+                    file, one line per run.
+    -O out_dir      Generate actual output and place it in the specified
+                    directory, one file per run.  Directory will be created
+                    if necessary.
+    -F              Report printer name as "family_modelno" rather than
+                    model ID.
+
+  Control options:
+    -H              Halt on any error.
+    -S              Run a separate testpattern command for each printer.
+    -SS             Run a separate testpattern command for each case (slow).
+
+  Debugging options:
+    -c              Use callgrind (incompatible with -v).
+    -g              Attach testpattern job to gdb.
+    -v[v[v[v]]]     Use valgrind.  Number of -v options controls usage:
+                    -v    Basic valgrind checking, no leak checking
+                    -vv   Additional leak checking
+                    -vvv  Show reachable data also
+                    -vvvv Minimal checks only
+
+  Test selection/control options:
+    -d option=value Test this option with only the specified (default) value,
+                    if available.  For Resolution and PageSize the special
+                    values MIN and MAX can be used to specify the
+                    lowest/smallest and highest/largest respectively.
+    -G geometry     Specify geometry (=(HxV)(+L+T), as fractions of page).
+    -o option       Test this option.  Multiple -o options may be specified.
+                    option1,option2... tests all combinations of each
+                    option.  For floating point and integer options, a
+                    selection of values is tested.
+                    To remove an option from the list tested, specify
+                    -o -option
+                    Default:
+                        $options
+    -o+             Any options specified with -o will be tested in addition
+                    to those specified (or omitted if -o -option is used)
+    -p page count   Specify number of pages to print per printer.  Default $std_pages.
+    -P page count   Specify number of pages to print per printer when testing
+                    duplex mode.  Default $duplex_pages.
+    -R              Use the minimum resolution (rather than the default)
+                    to test other options.  Equivalent to -dResolution=MIN.
+    -T maxres       Limit the tested resolutions to a maximum of maxres in
+                    both dimensions; use the lowest resolution available
+		    if none meet the criterion.
+    -X              Repeat specified cases listed on standard input.
+    -N              Supply all requested options, even if unused.
+    -u              Round all dimensions to the lower point (for
+                    regression testing against Gutenprint 5.2).
+
+  Miscellaneous options:
+    -i              Use the installed Gutenprint libraries rather than
+                    from source tree.
+    -q              Only list each printer as it is tested.
+    -qq             Print one dot for every printer.
+    -qqq            Do not report any output.
+
+  Information options (do not run tests):
+    -l              List available printers.
+    -L              List available options for specified printer.
+    -n              Do not actually run test (write out input that
+                    would be passed to testpattern).
+    -V              List available values for each option.
+EOF
+exit 1;
+}
+
+if ($help) {
+    print_help_and_exit();
+}
+
+if ($use_min_res) {
+    $base_settings{"Resolution"} = "MIN";
+}
+
+if (@special_options) {
+    my (%options);
+    my ($optseq) = 1;
+    if ((scalar grep { /^\+$/ } @special_options) ||
+	(! scalar grep { /^[^-]/ } @special_options)) {
+	map { $options{$_} = $optseq++; } @standard_options;
+    }
+    if (scalar grep { /^\-$/ } @special_options) {
+	%options = ();
+    }
+    foreach my $opt (@special_options) {
+	next if $opt eq '+';
+	if ($opt =~ /^-/) {
+	    $opt = substr($opt, 1);
+	    delete $options{$opt};
+	} else {
+	    if ($opt =~ /^\+/) {
+		$opt = substr($opt, 1);
+	    }
+	    if (! defined $options{$opt}) {
+		$options{$opt} = $optseq++;
+	    }
+	}
+    }
+    my (%ropt) = reverse %options;
+    @special_options = map { $ropt{$_} } sort { $a <=> $b } keys %ropt;
+} else {
+    @special_options = @standard_options;
+}
+
+my $bad_opt = 0;
+
+foreach my $opt (@default_options) {
+    if (! ($opt =~ /=/)) {
+	print STDERR "Malformed default option `$opt'\n";
+	$bad_opt = 1;
+    }
+    my ($option, $value) = split(/=/, $opt);
+    if (! $value) {
+	delete $base_settings{$option};
+    } else {
+	$base_settings{$option} = $value;
+    }
+}
+
+if ($bad_opt) {
+    print_help_and_exit();
+}
+
+my $pwd = `pwd`;
+chomp $pwd;
+
+my $srcdir = $ENV{"srcdir"};
+my $sdir;
+
+$geometry =~ s/^=*//;
+if ($geometry =~ /^(([01]?(\.[0-9]*)?)(x([01]?(\.[0-9]*)?))?)?(\+([01]?(\.[0-9]*)?)(\+([01]?(\.[0-9]*)?))?)?$/) {
+    my ($H) = $2;
+    my ($V) = $5;
+    my ($L) = $8;
+    my ($T) = $11;
+    if ($H) {
+	$hsize = $H;
+	if (not $V) {
+	    $V=$H;
+	}
+	if ($hsize > 1) {
+	    $hsize = 1;
+	}
+    }
+    if ($V) {
+	$vsize = $V;
+	if ($vsize > 1) {
+	    $vsize = 1;
+	}
+    }
+    if ($L) {
+	if (not $T) {
+	    $T=$L;
+	}
+	$left = $L;
+    }
+    if ($T) {
+	$top = $T;
+    }
+    if ($left + $hsize > 1) {
+	$left = 1 - $hsize;
+    }
+    if ($top + $vsize > 1) {
+	$top = 1 - $vsize;
+    }
+}
+
+if ("$srcdir" eq "" || "$srcdir" eq ".") {
+    $sdir = $pwd;
+} elsif ($srcdir =~ /^\//) {
+    $sdir = "$srcdir";
+} else {
+    $sdir = "$pwd/$srcdir";
+}
+
+if (! $run_installed && ! defined $ENV{"STP_DATA_PATH"}) {
+    $ENV{"STP_DATA_PATH"} = "${sdir}/../xml";
+}
+
+if (! defined $ENV{"STP_MODULE_PATH"}) {
+    $ENV{"STP_MODULE_PATH"} = "${sdir}/../main:${sdir}/../main/.libs";
+}
+
+sub set_opt($$$) {
+    my ($opt, $val, $printer) = @_;
+    my ($type) = $param_types{$printer}{$opt};
+    if ($type == 1) {
+	push @extras, "parameter_int \"$opt\" $val;\n";
+    } elsif ($type == 2) {
+	my ($xval) = $val;
+	if ($val =~ /true/i) {
+	    $xval = 1;
+	} elsif ($val =~ /false/i) {
+	    $xval = 0;
+	}
+	push @extras, "parameter_bool \"$opt\" $xval;\n";
+    } elsif ($type == 3) {
+	push @extras, "parameter_float \"$opt\" $val;\n";
+    } elsif ($type == 4) {
+	push @extras, "parameter_curve \"$opt\" \"$val\";\n";
+    } else {
+	if ($opt eq "PageSize" && $val =~ /^([^.]+)\.([0-9]+)x([0-9]+)$/) {
+	    push @extras, "parameter \"PageSize\" \"$1\";\n";
+	    push @extras, "page_size $2 $3;\n";
+	} else {
+	    push @extras, "parameter \"$opt\" \"$val\";\n";
+	}
+    }
+}
+
+sub set_message($) {
+    my ($message) = @_;
+    push @messages, "message \"$message\";\n" if (! $quiet);
+}
+
+sub set_global_message($) {
+    my ($message) = @_;
+    push @global_messages, "message \"$message\";\n"
+}
+
+sub print_one_testpattern($$$;$) {
+    my ($printer, $pages, $tp_mode, $raw) = @_;
+    my $stuff = join "", @global_messages;
+    $stuff .= join "", @job_extras;
+    $global_printer = $printer;
+    foreach my $page (0..$pages - 1) {
+	$global_page = $page;
+    	$stuff .= "printer \"$printer\";\n";
+	$stuff .= "parameter \"PageSize\" \"Auto\";\n";
+	$stuff .= join "", @messages, @extras;
+	if (! $quiet && $pages > 1) {
+	    $stuff .= "message \"(page $page)\";\n";
+	}
+	$stuff .= "parameter_int \"PageNumber\" $page;\n";
+	if ($page == 0) {
+	    $stuff .= "start_job;\n";
+	}
+	if ($page == $pages - 1) {
+	    $stuff .= "end_job;\n";
+	}
+	$stuff .= sprintf("hsize %f;\n", $hsize);
+	$stuff .= sprintf("vsize %f;\n", $vsize);
+	$stuff .= sprintf("left %f;\n", $left);
+	$stuff .= sprintf("top %f;\n", $top);
+	$stuff .= "blackline 0;\n";
+	$stuff .= "steps 16;\n";
+	if ($round) {
+	    $stuff .= "round;\n";
+	}
+	if ($raw > 0) {
+	    $stuff .= "mode extended $raw 16;\n";
+	    $stuff .= "xpattern ";
+	    for (my $i = 0; $i < $raw; $i++) {
+		$stuff .= "0.0 0.0 1.0  ";
+	    }
+	    $stuff .= ";\n";
+	    for (my $i = 0; $i < $raw; $i++) {
+		$stuff .= "xpattern ";
+		for (my $j = 0; $j < $raw; $j++) {
+		    if ($i == $j) {
+			$stuff .= "0.0 1.0 1.0  ";
+		    } else {
+			$stuff .= "0.0 0.0 1.0  ";
+		    }
+		}
+		$stuff .= ";\n";
+	    }
+	    $stuff .= "xpattern ";
+	    for (my $i = 0; $i < $raw; $i++) {
+		$stuff .= "0.0 0.0 1.0  ";
+	    }
+	    $stuff .= ";\n";
+	    $stuff .= "end;\n";
+	} else {
+	    $tp_mode =~ s/([81]+)/ $1/;
+	    $stuff .= << "EOF";
+mode $tp_mode;
+pattern 0.0 0.0 0.0 0.0 0.0 0.0 0.0 1.0  0.0 0.0 1.0  0.0 0.0 1.0  0.0 0.0 1.0 ;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.0 1.0  0.0 1.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.0 1.0  0.0 0.0 1.0 0.0 1.0 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 1.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.0 1.0  0.0 1.0 1.0 0.0 1.0 1.0 0.0 1.0 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.0 1.0  0.0 -2.0 1.0 0.0 -2.0 1.0 0.0 -2.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 -2.0 -2.0 -2.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.1 0.3 1.0 1.0 1.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.3 0.7 -2.0 -2.0 -2.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.1 0.999 1.0 1.0 1.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.3 0.999 1.0 1.0 1.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.5 0.999 1.0 1.0 1.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.1 0.3 -2.0 -2.0 -2.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.3 0.7 1.0 1.0 1.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.1 0.999 -2.0 -2.0 -2.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.3 0.999 -2.0 -2.0 -2.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 0.5 0.999 -2.0 -2.0 -2.0 0.0 1.0 1.0  0.0 0.0 1.0 0.0 0.0 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.0 1.0  0.0 0.0 1.0 0.0 1.0 1.0 0.0 1.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.25 1.0  0.0 0.0 1.0 0.0 0.75 1.0 0.0 0.75 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.25 1.0  0.0 0.0 1.0 0.0 0.75 1.0 0.0 0.75 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.5 1.0  0.0 0.0 1.0 0.0 0.5 1.0 0.0 0.5 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.5 1.0  0.0 0.0 1.0 0.0 0.5 1.0 0.0 0.5 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.75 1.0  0.0 0.0 1.0 0.0 0.25 1.0 0.0 0.25 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.75 1.0  0.0 0.0 1.0 0.0 0.25 1.0 0.0 0.25 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.9 1.0  0.0 0.0 1.0 0.0 0.1 1.0 0.0 0.1 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.9 1.0  0.0 0.0 1.0 0.0 0.1 1.0 0.0 0.1 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.0 1.0  0.0 1.0 1.0 0.0 0.0 1.0 0.0 1.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.25 1.0  0.0 0.75 1.0 0.0 0.0 1.0 0.0 0.75 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.25 1.0  0.0 0.75 1.0 0.0 0.0 1.0 0.0 0.75 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.5 1.0  0.0 0.5 1.0 0.0 0.0 1.0 0.0 0.5 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.5 1.0  0.0 0.5 1.0 0.0 0.0 1.0 0.0 0.5 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.75 1.0  0.0 0.25 1.0 0.0 0.0 1.0 0.0 0.25 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.75 1.0  0.0 0.25 1.0 0.0 0.0 1.0 0.0 0.25 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.9 1.0  0.0 0.1 1.0 0.0 0.0 1.0 0.0 0.1 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.9 1.0  0.0 0.1 1.0 0.0 0.0 1.0 0.0 0.1 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.0 1.0  0.0 1.0 1.0 0.0 1.0 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.25 1.0  0.0 0.75 1.0 0.0 0.75 1.0 0.0 0.0 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.25 1.0  0.0 0.75 1.0 0.0 0.75 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.5 1.0  0.0 0.5 1.0 0.0 0.5 1.0 0.0 0.0 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.5 1.0  0.0 0.5 1.0 0.0 0.5 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.75 1.0  0.0 0.25 1.0 0.0 0.25 1.0 0.0 0.0 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.75 1.0  0.0 0.25 1.0 0.0 0.25 1.0 0.0 0.0 1.0;
+pattern 1.0 1.0 1.0 1.0 1.0 0.0 0.9 1.0  0.0 0.1 1.0 0.0 0.1 1.0 0.0 0.0 1.0;
+pattern 0.0 0.0 1.0 1.0 1.0 0.0 0.9 1.0  0.0 0.1 1.0 0.0 0.1 1.0 0.0 0.0 1.0;
+end;
+EOF
+	}
+    }
+    return $stuff;
+}
+
+sub get_printers() {
+    map { $exclude_list{$_} = 1; } @exclude_list;
+    $include_pattern = join("|", map {"($_)"} @include_patterns);
+    $exclude_pattern = join("|", map {"($_)"} @exclude_patterns);
+    my (@nprinter_list);
+    my $extra_arg = "";
+    my (%families);
+    my (%model_families);
+    my (%printer_models);
+    map { $families{$_} = 1; } @families;
+    open PIPE, "./printers|" or die "Cannot run printers: $!\n";
+    my ($line_count);
+    while(<PIPE>) {
+	next if m!^#!;
+	chomp;
+	$line_count++;
+	my ($model, $family, $printer) = split;
+	my ($model_family) = "${model}_${family}";
+	$printer_models{$printer} = $model_family;
+	if (! defined $model_families{$model_family}) {
+	    $model_families{$model_family} = $printer;
+	}
+	next if @families && ! defined $families{$family};
+	next if $exclude_list{$printer};
+	next if $exclude_pattern ne '' && $printer =~ /$exclude_pattern/;
+	next if $include_pattern ne '' && ! $printer =~ /$include_pattern/;
+	next if $skip_duplicate_printers && $model_families{$model_family} ne $printer;
+	push @nprinter_list, $printer;
+    }
+    close PIPE;
+    if ($#ARGV >= 0) {
+	my ($bad_printers_found) = 0;
+	@nprinter_list = grep { defined $_ } map {
+	    if (defined $printer_models{$_}) {
+		$_;
+	    } elsif (defined $model_families{$_}) {
+		$model_families{$_};
+	    } else {
+		print STDERR "Unknown printer ${_}!\n";
+		$bad_printers_found = 1;
+		undef;
+	    }
+	} @ARGV;
+    }
+    exit 1 if (! scalar @nprinter_list);
+    return @nprinter_list;
+}
+
+sub load_printer_data() {
+    my ($extra_arg) = join(" ", @printer_list);
+    open PIPE, "./printer_options $extra_arg|" or die "Cannot run printer_options: $!\n";
+    while(<PIPE>) {
+	next if m!^#!;
+	eval $_;
+    }
+    close PIPE or die "Cannot run printer_options: $!\n";
+    if ($rerun) {
+	while (<>) {
+	    chomp;
+	    s/^[^a-zA-Z]*//;
+	    s/\..*//;
+	    $rerun_cases{$_} = 1;
+	}
+    }
+
+    my (@nprinter_list);
+    foreach my $printer (@printer_list) {
+	my $model_id = $models{$printer};
+	my $family_id = $families{$printer};
+	if (($skip_duplicate_printers && $models_found{$family_id}{$model_id}) ||
+	    (@families && ! grep { $family_id eq $_ } @families)) {
+	} else {
+	    $models_found{$family_id}{$model_id} = 1;
+	    push @nprinter_list, $printer;
+	}
+    }
+    @printer_list = @nprinter_list;
+}
+
+sub do_print($$) {
+    my ($output, $fh) = @_;
+    if ($dontrun) {
+	print $output;
+    } elsif (! $fh) {
+	restart_testpattern(1);
+	print $global_fh $output;
+	my ($status) = close $global_fh;
+	if (!$status) {
+	    if ($? == 2) {
+		stopit();
+	    }
+	    $error++;
+	    if ($single > 1) {
+		warn("\n*** FAIL $global_case ($?)\n");
+	    } else {
+		warn("\n*** FAIL ($?)\n");
+	    }
+	    if ($halt_on_error) {	# SIGINT
+		stopit();
+	    }
+	}
+    } else {
+	print $fh $output;
+    }
+}
+
+sub do_output($) {
+    my ($outkey) = @_;
+    if (defined $output || defined $csum_dir ||
+	defined $csum_file) {
+	my $checksum_cmd;
+	my $outbase = "${outkey}.prn";
+	my $outfile = "$output/$outbase";
+	if (defined $csum_file) {
+	    $checksum_cmd = "${csum_type}sum -b | sed 's/-/$outbase/'";
+	    if ($csum_file =~ /^\:([0-9]+)$/) {
+		$checksum_cmd .= " 1>&$1";
+	    } elsif ($csum_file ne '' && $csum_file ne '-') {
+		$checksum_cmd .= " >> '$csum_file'";
+	    }
+	} elsif (defined $csum_dir) {
+	    my $checksum_dir = $csum_dir;
+	    if (defined $csum_dir && $csum_dir eq "") {
+		$checksum_dir = $output;
+	    }
+	    my $checksumfile = "$checksum_dir/${outkey}.checksum";
+	    if (! $checksum_dir) {
+		$checksumfile = "${outkey}.checksum";
+	    }
+	    $checksum_cmd = "${csum_type}sum -b | sed 's/-/$outbase/' > '$checksumfile'";
+	}
+	if ($output && $checksum_cmd ne "") {
+	    push @job_extras, "output \"|tee '$outfile' | $checksum_cmd\";\n";
+	} elsif ($output) {
+	    push @job_extras, "output \"$outfile\";\n";
+	} else {
+	    push @job_extras, "output \"|$checksum_cmd\";\n";
+	}
+    }
+}
+
+sub build_list($$$$) {
+    my ($keys, $printer, $min_res, $max_res) = @_;
+    my (@keys) = split (/,/, $keys);
+    my ($key) = $keys[0];
+    my ($rest);
+    my (@stuff);
+    if ($#keys > 0) {
+	$rest = join ",", @keys[1..$#keys];
+	@stuff = build_list($rest, $printer, $min_res, $max_res);
+    }
+    my (@tmp);
+    if ($key =~ /=/) {
+	my (@values);
+	my ($vlist);
+	($key, $vlist) = split(/=/, $key);
+	@tmp = split(/;/, $vlist);
+	if ($key eq 'Resolution') {
+	    @tmp = map {
+		if ($_ eq 'MIN') {
+		    $min_res;
+		} elsif ($_ eq 'MAX') {
+		    $max_res;
+		} else {
+		    $_
+		}
+	    } @tmp;
+	} elsif ($key eq 'PageSize') {
+	    @tmp = map {
+		if ($_ eq 'MIN') {
+		    $min_page_size{$printer}
+		} elsif ($_ eq 'MAX') {
+		    $max_page_size{$printer}
+		} else {
+		    $_
+		}
+	    } @tmp;
+	}
+    } elsif ($param_types{$printer}{$key} == 3) {
+	my (@vals) = @{$stp_float_values{$printer}{$key}};
+	my ($minv) = $vals[2];
+	my ($defv) = $vals[1];
+	my ($maxv) = $vals[3];
+	push @tmp, $minv;
+	push @tmp, ($minv + $defv) / 2.0;
+	push @tmp, $defv;
+	push @tmp, ($defv + $maxv) / 2.0;
+	push @tmp, $maxv;
+    } elsif ($param_types{$printer}{$key} == 1) {
+	my (@vals) = @{$stp_int_values{$printer}{$key}};
+	my ($minv) = $vals[2];
+	my ($maxv) = $vals[3];
+	push @tmp, ($minv..$maxv);
+    } elsif ($param_types{$printer}{$key} == 2) {
+	push @tmp, 0;
+	push @tmp, 1;
+    } elsif ($key eq "TPMode") {
+	push @tmp, @tp_modes;
+    } elsif ($key eq "Resolution") {
+	@tmp = sort keys %{$resolutions{$printer}};
+	if ($res_limit > 0) {
+	    @tmp = grep { $resolutions{$printer}{$_}[0] <= $res_limit &&
+			      $resolutions{$printer}{$_}[1] <= $res_limit} @tmp;
+	}
+	if (! @tmp) {
+	    push @tmp, $min_res;
+	}
+    } elsif (defined($param_types{$printer}{$key})) {
+	@tmp = @{$stpdata{$printer}{$key}};
+    }
+    if (! @tmp) {
+	return @stuff;
+    } elsif (! @stuff) {
+	return @tmp;
+    } else {
+	my (@answer);
+	foreach my $i (@tmp) {
+	    foreach my $j (@stuff) {
+		push @answer, "$i,$j";
+	    }
+	}
+	return @answer;
+    }
+    return @tmp;
+}
+
+sub build_key($$) {
+    my ($keys, $printer) = @_;
+    my (@keys) = split (/,/, $keys);
+    my (@answer) = grep { $_ eq "TPMode" || defined $param_types{$printer}{$_} || /=/ } @keys;
+    return join ",", @answer;
+}
+
+sub get_min_max_res($) {
+    my ($printer) = @_;
+    my (%reslist) = %{$resolutions{$printer}};
+    my $min_res_name;
+    my $min_res_value = 5760*5760;
+    my $max_res_name;
+    my $max_res_value = 0;
+    # We want to get the same named resolution each time.
+    foreach my $resid (sort keys %reslist) {
+	my ($res) = $reslist{$resid};
+	my ($res_value) = $$res[0] * $$res[1];
+	if ($res_value < $min_res_value) {
+	    $min_res_value = $res_value;
+	    $min_res_name = $resid;
+	}
+	if ($res_value > $max_res_value) {
+	    $max_res_value = $res_value;
+	    $max_res_name = $resid;
+	}
+    }
+    return ($min_res_name, $max_res_name);
+}
+
+sub get_printing_modes($) {
+    my ($printer) = @_;
+    my (@printing_modes) = grep {$_ ne 'None' } @{$stpdata{$printer}{'PrintingMode'}};
+    if ($base_settings{'PrintingMode'}) {
+	if ($base_settings{'PrintingMode'} eq 'Color' &&
+	    grep { $_ eq 'Color' } @printing_modes) {
+	    return ('Color');
+	} elsif ($base_settings{'PrintingMode'} eq 'BW' &&
+		 grep { $_ eq 'BW' } @printing_modes) {
+	    return ('BW');
+	} else {
+	    return ();
+	}
+    } else {
+	return @printing_modes;
+    }
+}
+
+sub get_optvals($$$) {
+    my ($printer, $min_res_name, $max_res_name) = @_;
+    my (%opt_vals);
+    if (! @special_options) {
+	$opt_vals{"Default"} = ['all'];
+    } else {
+	foreach my $key (@special_options) {
+	    my (@subkeys) = (split(/,/, $key));
+	    my $nkey = build_key($key, $printer);
+	    if ($nkey ne "") {
+		my (@vals) = build_list($nkey, $printer, $min_res_name, $max_res_name);
+		$nkey =~ s/=[^,]*//g;
+		$opt_vals{$nkey} = \@vals;
+	    }
+	}
+    }
+    return %opt_vals;
+}
+
+sub setup_printer_params($) {
+    my ($printer) = @_;
+    if ($stpdata{$printer}) {
+	foreach my $k (sort keys %{$stpdata{$printer}}) {
+	    my ($vals) = $stpdata{$printer}{$k};
+	    foreach my $v (0..@$vals) {
+		if (substr($$vals[$v], 0, 1) eq '+') {
+		    $$vals[$v] = substr($$vals[$v], 1);
+		    $defaults{$printer}{$k} = $$vals[$v];
+		    last;
+		}
+	    }
+	}
+	map { $param_types{$printer}{$_} = 0 } keys %{$stpdata{$printer}};
+    }
+    $param_types{$printer}{"Resolution"} = 0;
+    if ($stp_int_values{$printer}) {
+	map { $param_types{$printer}{$_} = 1 } keys %{$stp_int_values{$printer}};
+    }
+    if ($stp_bools{$printer}) {
+	map { $param_types{$printer}{$_} = 2 } keys %{$stp_bools{$printer}};
+    }
+    if ($stp_float_values{$printer}) {
+	map { $param_types{$printer}{$_} = 3 } keys %{$stp_float_values{$printer}};
+    }
+    if ($stp_dimension_values{$printer}) {
+	map { $param_types{$printer}{$_} = 8 } keys %{$stp_dimension_values{$printer}};
+    }
+    # curve = 4
+    # file = 5
+    # raw = 6
+    # array = 7
+}
+
+# Resolution and PageSize need special handling because of MIN and MAX
+# Duplex needs special handling because of printing multiple pages, and
+#        need to set JobMode
+# RawChannels needs special handling because it's handled specially by
+#        the underlying testpattern command.
+sub do_printer($$) {
+    my ($printer, $global_fh) = @_;
+    my $first_time = 1;
+    my %opt_vals = {};
+
+    setup_printer_params($printer);
+    my (@printing_modes) = get_printing_modes($printer);
+    return if (! @printing_modes);
+    my ($min_res, $max_res) = get_min_max_res($printer);
+    my (%opt_vals) = get_optvals($printer, $min_res, $max_res);
+    foreach my $pmode (sort @printing_modes) {
+	foreach my $key (sort keys %opt_vals) {
+	    next if ($key eq "RawChannels" && $pmode ne "Color");
+	    next if (! defined $opt_vals{$key} || $opt_vals{$key} < 1);
+	    my (@opts) = sort @{$opt_vals{$key}};
+	    my (@subkeys) = split (/,/, $key);
+	    my (%subkeys);
+	    map {$subkeys{$_} = 1} @subkeys;
+	    my $opt;
+	    foreach $opt (@opts) {
+		@messages = ();
+		@global_messages = ();
+		$case_no++;
+		next if (($case_no % $stp_test_rotor_circumference) != $stp_test_rotor);
+		my ($pname) = $print_family ?
+		    "${models{$printer}}-$families{$printer}" : $printer;
+		if ($first_time) {
+		    if ($quiet < 2) {
+			set_global_message("$pname\n");
+		    } elsif ($quiet == 2) {
+			set_global_message(".");
+		    }
+		    $first_time = 0;
+		}
+		next if ($proc_count > 0 && ($case_no % $proc_count) != $proc_rotor);
+		my ($tp_mode) = "rgb8";
+		@extras = ();
+		@job_extras = ();
+		my (@ovals);
+		my $rawval;
+		my (@subopts) = split (/,/, $opt);
+		map {
+		    my $k = $subkeys[$_];
+		    my $v = $subopts[$_];
+		    next if ($k eq "RawChannels" && $v ne "None" && $pmode ne "Color");
+		    if ($k eq "RawChannels") {
+			$rawval = $v;
+		    } elsif ($k eq "TPMode") {
+			$tp_mode = $v;
+		    } else {
+			set_opt($k, $v, $printer);
+		    }
+		    push @ovals, "${k}=${v}";
+		} (0..$#subkeys);
+		map {
+		    if ($key ne $_) {
+			my $setting = $base_settings{$_};
+			if ($_ eq "Resolution" && $setting eq "MIN") {
+			    $setting = $min_res;
+			} elsif ($_ eq "Resolution" && $setting eq "MAX") {
+			    $setting = $max_res;
+			} elsif ($_ eq "PageSize" && $setting eq "MIN") {
+			    $setting = $min_page_size{$printer};
+			} elsif ($_ eq "PageSize" && $setting eq "MAX") {
+			    $setting = $max_page_size{$printer};
+			}
+			set_opt($_, $setting, $printer);
+			push @ovals, "${_}=$setting";
+		    }
+		} grep { ! defined $subkeys{$_} &&
+			     ($use_unused_options || $_ eq "Resolution" ||
+			      $_ eq "TPMode" ||
+			      defined $stpdata{$printer}{$_})} (sort keys %base_settings);
+		my $pages = $std_pages;
+		set_opt("PrintingMode", $pmode, $printer);
+		if ($key =~ /Duplex/) {
+		    set_opt("JobMode", "Job", $printer);
+		    $pages = $duplex_pages;
+		}
+		my $rawval;
+		my ($mstring) = join "_", @ovals;
+		$mstring =~ s/=/_/g;
+		my ($ostring) = join "+", @ovals;
+		my $case = "${pname}_PrintingMode_${pmode}_${mstring}";
+		$global_case = $case;
+		if (! $rerun || $rerun_cases{$case}) {
+		    $global_messages = $case;
+		    do_output($case);
+		    set_message("    ${pmode}+${ostring}");
+		    my $output = print_one_testpattern($printer, $pages, $tp_mode, $rawval);
+		    do_print($output, $global_fh);
+		}
+	    }
+	}
+    }
+    # Increment the rotor here also, so that if the degree of parallelism is even
+    # and we're running with -o - (an easy way to run minimal cases) we won't wind
+    # up with half the workers running color and half running black and white.
+    $case_no++;
+}
+
+sub restart_testpattern {
+    my ($silent) = @_;
+    if (! $silent) {
+	close($global_fh);
+	my ($err) = $? & 255;
+	if ($err > 0) {
+	    $error++;
+	}
+	if ($single > 1) {
+	    warn("\n***TESTPATTERN CRASHED*** ($global_case) ($err)!\n");
+	} else {
+	    warn("\n***TESTPATTERN CRASHED*** (cannot determine case, near $global_case) ($err)!\n");
+	}
+	if ($halt_on_error) {
+	    stopit();
+	}
+    }
+    open($global_fh, "|$testpattern_command") or
+	die "Can't run $testpattern_command: $!\n";
+}
+
+sub stopit {
+    if ($single > 1) {
+	print "\nStopping, $error case(s) failed.\n";
+	exit 1;
+    } elsif ($error) {
+	print "\nStopping, failures noted.\n";
+	exit 1;
+    } else {
+	print "\nStopping.\n";
+	exit 0;
+    }
+}
+
+sub get_default($$) {
+    my ($printer, $opt) = @_;
+    if (defined $defaults{$printer}{$opt}) {
+	return $defaults{$printer}{$opt};
+    } else {
+	return $stpdata{$printer}{$opt}[0];
+    }
+}
+
+sub list_options() {
+    if ($#printer_list > 0) {
+	die "-L must be used with one printer\n";
+    }
+    my ($printer) = $printer_list[0];
+    foreach my $opt (sort keys %{$stpdata{$printer}}) {
+	print "$opt\n";
+	if ($verbose) {
+	    if ($param_types{$printer}{$opt} == 3) {
+		my (@vals) = @{$stp_float_values{$printer}{$opt}};
+		print "    $vals[2]\n";
+		print "  =>$vals[1]\n";
+		print "    $vals[3]\n";
+	    } elsif ($param_types{$printer}{$opt} == 1) {
+		my (@vals) = @{$stp_float_values{$printer}{$opt}};
+		print "    $vals[2]\n";
+		print "    $vals[3]\n";
+	    } elsif ($param_types{$printer}{$opt} == 2) {
+		if ($defaults{$printer}{$opt}) {
+		    print "    0\n";
+		    print "  =>1\n";
+		} else {
+		    print "  =>0\n";
+		    print "    1\n";
+		}
+	    } else {
+		my ($default) = get_default($printer, $opt);
+		foreach my $val (sort @{$stpdata{$printer}{$opt}}) {
+		    if ($val eq $default) {
+			print "  =>$val\n";
+		    } else {
+			print "    $val\n";
+		    }
+		}
+	    }
+	}
+    }
+}
+
+sub runit() {
+    my $valgrind_command;
+    my $valopts;
+    if ($gdb_attach) {
+	$proc_count = 1;
+    }
+
+    # V A L G R I N D #
+    if ($callgrind) {
+	$valopts = '--tool=callgrind --dump-instr=yes --trace-jump=yes';
+	$valgrind = 4;
+    } elsif ($valgrind) {
+	$valopts = '--tool=memcheck';
+    }
+    if ($gdb_attach) {
+	$valopts .= ' --vgdb=yes';
+    }
+    if ($valgrind == 1) {
+	$valgrind_command = "$vg $valopts -q --num-callers=50 --error-limit=no --leak-check=yes --error-exitcode=1";
+    } elsif ($valgrind == 2) {
+	$valgrind_command = "$vg $valopts --num-callers=50 --error-limit=no --leak-resolution=high --leak-check=yes --error-exitcode=1";
+    } elsif ($valgrind == 3) {
+	$valgrind_command = "$vg $valopts --error-limit=no --num-callers=50 --show-reachable=yes --leak-resolution=high --leak-check=yes --error-exitcode=1";
+    } elsif ($valgrind == 4) {
+	$valgrind_command = "$vg $valopts --error-exitcode=1";
+    }
+
+    # O U T P U T #
+    if (defined $output && $output ne "" && ! -d $output) {
+	mkdir $output || die "Can't create directory $output: $!\n";
+    }
+
+    if (defined $csum_dir && $csum_dir ne "" && ! -d $csum_dir) {
+	mkdir $csum_dir || die "Can't create directory $csum_dir: $!\n";
+    }
+
+    if (defined $csum_file && ! $csum_file =~ /^\:([0-9]+)$/) {
+	unlink $csum_file;
+	system "touch $csum_file";
+    }
+
+    # # # # # # # #
+    my ($suppress);
+    if (! defined $output && ! defined $csum_dir &&
+	! defined $csum_file) {
+	$suppress = '-n';
+    }
+    my (@children);
+    my ($child_no);
+    my ($kid);
+    load_printer_data();
+    # Note that when testing duplex all pages of the duplex run are done by
+    # one process, but each page counts as a separate test.  So the number
+    # of cases per process may not always be within 1.
+    if ($proc_count > 1) {
+	for ($child_no = 0; $child_no < $proc_count; $child_no++) {
+	    $kid = fork();
+	    if ($kid == 0) {
+		last;
+	    } else {
+		push @children, $kid;
+		$proc_rotor++;
+	    }
+	}
+    }
+
+    my $status = 1;
+    if ($proc_count > 1 && $kid > 0) {
+	# Parent in parallel case
+	while ($proc_count > 0 && $kid > 0) {
+	    $kid = waitpid(-1, 0);
+	    if ($kid > 0 && $? > 0) {
+		$error++;
+	    }
+	}
+    } else {
+	my ($qopt) = $quiet ? "-q" : "";
+	my ($Hopt) = $halt_on_error ? "-H" : "";
+	$testpattern_command = "$valgrind_command ./testpattern -y $suppress $qopt $Hopt";
+	if ($single > 1) {
+	    $SIG{TERM} = sub() { stopit() };
+	    $SIG{HUP} = sub() { stopit() };
+	    $SIG{INT} = sub() { stopit() };
+	    foreach my $printer (@printer_list) {
+		do_printer($printer, undef);
+	    }
+	} elsif ($single) {
+	    $SIG{PIPE} = sub() { restart_testpattern() };
+	    foreach my $printer (@printer_list) {
+		restart_testpattern(1);
+		do_printer($printer, $global_fh);
+		$status |= close $global_fh;
+		$error += ($? != 0);
+	    }
+	} else {
+	    $SIG{PIPE} = sub() { restart_testpattern() };
+	    restart_testpattern(1);
+	    map { do_printer($_, $global_fh) } @printer_list;
+	    $status = close $global_fh;
+	}
+    }
+    if ($quiet == 2) {
+	print STDERR "\n";
+    }
+    if ($status && ! $error) {
+	return 0;
+    } else {
+	if ($error) {
+	    if ($single > 1) {
+		print STDERR "$error cases failed\n";
+	    } else {
+		my ($plural) = ($error > 1 ? "ES" : "");
+		print STDERR "*** $error CRASH${plural} NOTED***\n";
+	    }
+	}
+	return 1;
+    }
+}
+
+@printer_list = get_printers();
+if ($list_printers) {
+    print join("\n", sort @printer_list), "\n";
+} elsif ($list_options) {
+    load_printer_data();
+    list_options();
+} elsif ($dontrun) {
+    load_printer_data();
+    map { do_printer($_, \*STDOUT) } @printer_list;
+} else {
+    exit(runit());
+}

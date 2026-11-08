@@ -1,0 +1,1035 @@
+#!@PERL@
+
+# Copyright 2000-2008 Robert Krawitz <rlk@alum.mit.edu>
+#
+#   This program is free software; you can redistribute it and/or modify it
+#   under the terms of the GNU General Public License as published by the Free
+#   Software Foundation; either version 2 of the License, or (at your option)
+#   any later version.
+#
+#   This program is distributed in the hope that it will be useful, but
+#   WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+#   or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+#   for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+use Getopt::Std;
+use strict;
+
+getopts('VvO:');
+
+use vars qw($atend
+	    $escpr
+	    $stuff
+	    $opt_v
+	    $opt_V
+	    $opt_O
+	    $curoffset
+	    $curpos
+	    $esc
+	    $initial_vertical_position
+	    $null
+	    $page_mgmt_unit
+	    $horizontal_position
+	    $horizontal_unit
+	    $vertical_unit
+	    $vertical_position
+	    $raster_x
+	    $raster_y
+	    $print_offsets
+	    %seqtable
+	    @seqkeys
+	    %chartable
+	    %xchartable
+	    %nchartable
+	    %rchartable
+	    %keylengths
+	    $total_length
+	    @offsets);
+
+$atend = 0;
+$escpr = 0;
+%chartable = ();
+%xchartable = ();
+%nchartable = ();
+%rchartable = ();
+%keylengths = ();
+
+%seqtable = ( "@", 0,
+	      "(R", "REMOTE",
+	      "(", "VARIABLE",
+	      "U", 1,
+	      "\\", 2,
+	      "\$", 2,
+	      "r", 1,
+	      "\031", 1,
+	      ".", "SPECIAL",
+	      "i", "SPECIAL1",
+	      "\000", 2,
+	      "\001", 22
+	  );
+
+map {
+    my ($xchar) = pack("C", $_);
+    if ($_ >= 32 && $_ < 127) {
+	$chartable{$xchar} = " $xchar";
+	$xchartable{$xchar} = " *$xchar";
+	$rchartable{$xchar} = $xchar;
+    } else {
+	$chartable{$xchar} = sprintf("%02x", $_);
+	$xchartable{$xchar} = sprintf("*%02x", $_);
+	$rchartable{$xchar} = sprintf("%02x ", $_);
+    }
+    $nchartable{$xchar} = $_;
+} (0..255);
+
+@seqkeys = (sort { length $b <=> length $a } keys %seqtable);
+
+map { $keylengths{$_} = length $_ } @seqkeys;
+
+$esc = "\033";
+$null = "\000";
+
+$curpos = 0;
+$curoffset = 0;
+
+$page_mgmt_unit = 360;
+$horizontal_unit = 180;
+$vertical_unit = 360;
+
+$initial_vertical_position = 0;
+$vertical_position = 0;
+$horizontal_position = 0;
+$print_offsets = 0;
+$total_length = 0;
+
+sub get_long($) {
+    my ($string) = @_;
+    my ($tmp) = unpack("V", $string);
+    if ($tmp >= (1 << 31)) {
+	return -(0xffffffff ^ $tmp) - 1;
+    } else {
+	return $tmp;
+    }
+}
+
+sub get_long_at($) {
+    my ($offset) = @_;
+    return get_long(substr($stuff, $curoffset + $offset, 4))
+}
+
+sub get_short($) {
+    my ($string) = @_;
+    my ($tmp) = unpack("v", $string);
+    if ($tmp >= (1 << 15)) {
+	return -(0xffff ^ $tmp) - 1;
+    } else {
+	return $tmp;
+    }
+}
+
+sub get_raw_at($;$) {
+    my ($offset, $count) = @_;
+    $count = 1 if ! defined $count;
+    return substr($stuff, $curoffset + $offset, $count);
+}
+
+sub get_short_at($) {
+    my ($offset) = @_;
+    return get_short(get_raw_at($offset, 2))
+}
+
+sub get_byte($) {
+    my ($string) = @_;
+    return $nchartable{substr($string, 0, 1)};
+}
+
+sub get_byte_at($) {
+    my ($offset) = @_;
+    return get_byte(get_raw_at($offset, 1))
+}
+
+sub get_blong_at($) {
+    my ($offset) = @_;
+    return get_blong(substr($stuff, $curoffset + $offset, 4));
+}
+
+sub get_bshort_at($) {
+    my ($offset) = @_;
+    return get_bshort(substr($stuff, $curoffset + $offset, 2));
+}
+
+sub get_blong($) {
+    my ($string) = @_;
+    my ($tmp) = unpack("N", $string);
+    if ($tmp >= (1 << 31)) {
+	return -(0xffffffff ^ $tmp) - 1;
+    } else {
+	return $tmp;
+    }
+}
+
+sub get_bshort($) {
+    my ($string) = @_;
+    my ($tmp) = unpack("n", $string);
+    if ($tmp >= (1 << 15)) {
+	return -(0xffff ^ $tmp) - 1;
+    } else {
+	return $tmp;
+    }
+}
+
+sub get_string_at($$) {
+    my ($offset, $count) = @_;
+    return join('', map { $rchartable{get_raw_at($offset + $_)}} (0..$count-1));
+}
+
+sub get_char_at($) {
+    my ($offset) = @_;
+    return $chartable{get_raw_at($offset, 1)};
+}
+
+sub get_vector_at($$;$) {
+    my ($offset, $count, $nospc) = @_;
+    my ($str) = get_raw_at($offset, $count);
+    if ($nospc) {
+	return sprintf("%*v02x ", $str);
+    } else {
+	return sprintf("%*v02x ", " ", $str);
+    }
+}
+
+sub fill_buffer($) {
+    my ($where) = @_;
+    return 1 if $total_length - $curoffset >= $where;
+    my ($end) = $total_length - $curoffset;
+    if ($curpos == 0 && $end == 0) {
+	$stuff = <>;		# Need to do this once to "activate" ARGV
+	$total_length = length $stuff;
+	$end = $total_length - $curoffset;
+    }
+    my ($old_end) = $end;
+    my ($tmp);
+    my ($bytes_to_read) = 16384;
+    if ($where - $end > $bytes_to_read) {
+	$bytes_to_read = $where - $end;
+    }
+    if ($curoffset >= 16384) {
+	substr($stuff, 0, $curoffset) = "";
+	$total_length -= $curoffset;
+	$curoffset = 0;
+    }
+    while ($end < $where) {
+	my $foo = read ARGV, $tmp, $bytes_to_read;
+	$stuff .= $tmp;
+	$end += $foo;
+	$total_length += $foo;
+	if ($old_end == $end) {
+	    $atend = 1;
+	    return 0;
+	} else {
+	    $bytes_to_read -= $end - $old_end;
+	    $old_end = $end;
+	}
+    }
+    return 1;
+}
+
+sub increment_curpos($) {
+    my ($curpos_increment) = @_;
+    $curpos += $curpos_increment;
+    $curoffset += $curpos_increment;
+}
+
+sub print_escpr_data($$$$$) {
+    my ($outbytes, $compression, $bpp, $offset, $expected) = @_;
+    if ($compression == 0) {
+	printf("%*v02x ", " ", substr($stuff, $offset, $outbytes * 3));
+	if ($expected != $outbytes) {
+	    printf "**** Wrong byte count: got %d, expected %d (%x)!!!", $outbytes, $expected, $expected;
+	}
+    } else {
+	my ($totbytes) = 0;
+	my ($orig_outbytes) = $outbytes;
+	while ($outbytes > 0) {
+	    my ($place) = $offset + $orig_outbytes - $outbytes;
+	    my $counter = ord(substr($stuff, $place, 1));
+	    $place++;
+	    $outbytes--;
+	    if ($counter <= 127) {
+		$counter++;
+		$counter *= $bpp;
+		$outbytes -= $counter;
+		printf("%*v02x ", " ", substr($stuff, $place, $counter));
+	    } else {
+		$counter = 257 - $counter;
+		$counter *= $bpp;
+		$outbytes -= $bpp;
+		my ($fchar) = sprintf "%*v02x ", " ", substr($stuff, $place, $bpp);
+		my ($outdata);
+		map { $outdata .= $fchar } (0..$counter - 1);
+		print $outdata;
+	    }
+	    $totbytes += $counter;
+	}
+	$totbytes /= $bpp;
+	if ($totbytes != $expected) {
+	    print "**** Wrong byte count: got $totbytes, expected $expected!!!";
+	}
+    }
+}
+
+sub do_escpr() {
+    my ($print_width, $print_length, $bpp);
+    while (fill_buffer(4)) {
+	printf("\n%08x    ", $curpos);
+	my ($cmd) = substr($stuff, $curoffset, 1);
+	my ($ncmd) = $nchartable{$cmd};
+	printf(" %02x ", $ncmd);
+	increment_curpos(1);
+	if ($cmd ne "$esc") {
+	    next;
+	}
+	my ($class) = substr($stuff, $curoffset, 1);
+	printf(" %s ", $class);
+	increment_curpos(1);
+	if ($class eq "@") {
+	    return;
+	}
+	my ($skipchars) = get_long(substr($stuff, $curoffset + 0, 4));
+	printf " %08x ", $skipchars;
+	increment_curpos(4);
+	fill_buffer(4);
+	my ($remaining) = $skipchars;
+	$cmd = substr($stuff, $curoffset + 0, 4);
+	printf(" %4s ", $cmd);
+	increment_curpos(4);
+	fill_buffer($skipchars);
+	if ($cmd eq "setq") {	# Set Quality
+	    my (@qualities) = qw(draft normal high);
+	    my (@colormono) = qw(color mono);
+	    my (@colordepth) = qw(24 8);
+	    printf("%*v02x ", " ", substr($stuff, $curoffset + 0, $skipchars));
+	    if ($opt_v) {
+		printf(" (Set Quality: Media: %02x Quality: %s Color: %s Brightness: %02x Contrast: %02x Saturation: %02x Color Depth: %x (%s) Palette Size: %04x)",
+		       get_byte_at(0),
+		       $qualities[get_byte_at(1)],
+		       $colormono[get_byte_at(2)],
+		       get_byte_at(3),
+		       get_byte_at(4),
+		       get_byte_at(5),
+		       get_byte_at(6),
+		       $colordepth[get_byte_at(6)],
+		       get_short_at(7));
+	    }
+	    $bpp = get_byte_at(6) ? 1 : 3;
+	    increment_curpos($skipchars);
+	} elsif ($cmd eq "setj") { # Set Job
+	    my (@resolution) = qw(360 720);
+	    my (@direction) = qw(bi uni);
+	    printf("%*v02x ", " ", substr($stuff, $curoffset + 0, $skipchars));
+	    if ($opt_v) {
+		printf(" (Set Job: Paper (%d %d) (%.1f %.1f) Top %d Left %d Printable (%d %d) (%.2f %.2f) In Resolution %s Direction %s)",
+		       get_blong_at(0),
+		       get_blong_at(4),
+		       get_blong_at(0) / $resolution[get_byte_at(20)],
+		       get_blong_at(4) / $resolution[get_byte_at(20)],
+		       get_bshort_at(8),
+		       get_bshort_at(10),
+		       get_blong_at(12),
+		       get_blong_at(16),
+		       get_blong_at(12) / $resolution[get_byte_at(20)],
+		       get_blong_at(16) / $resolution[get_byte_at(20)],
+		       $resolution[get_byte_at(20)],
+		       $direction[get_byte_at(21)]);
+	    }
+	    $print_width = get_blong_at(12);
+	    $print_length = get_blong_at(16);
+	    increment_curpos($skipchars);
+	} elsif ($cmd eq "sttp") { # Start Page
+	    printf("%*v02x ", " ", substr($stuff, $curoffset + 0, $skipchars));
+	} elsif ($cmd eq "dsnd") { # Data Send
+	    printf("%*v02x ", " ", substr($stuff, $curoffset + 0, 7));
+	    if ($opt_v) {
+		printf(" (Send Data: Offset (%d %d) Compression %d Size %d) ",
+		       get_bshort_at(0),
+		       get_bshort_at(2),
+		       get_byte_at(4),
+		       get_bshort_at(5));
+	    }
+	    if ($opt_V) {
+		print_escpr_data(get_bshort_at(5), get_byte_at(4), $bpp, $curoffset + 7, $print_width);
+		increment_curpos($skipchars);
+	    } else {
+		increment_curpos($skipchars);
+	    }
+	} elsif ($cmd eq "bsnd") { # Data Send -- ???
+	    printf("%*v02x ", " ", substr($stuff, $curoffset + 0, 34));
+	    my ($data_size) = get_blong_at(18) + get_blong_at(22) + get_blong_at(26);
+	    if ($opt_v) {
+		printf(" (Send Data: Offset (%d %d) Compression %d Size %d %d %d = %x, delta = %x) ",
+		       get_bshort_at(3),
+		       get_bshort_at(5),
+		       get_byte_at(7),
+		       get_blong_at(18),
+		       get_blong_at(22),
+		       get_blong_at(26),
+		       $data_size,
+		       $skipchars - ($data_size + 42))
+	    }
+	    if ($opt_V) {
+		print_escpr_data($data_size, get_byte_at(7), $bpp, $curoffset + 34, $print_width);
+	    }
+	    increment_curpos($skipchars);
+	} elsif ($cmd eq "endp") { # End Page
+	    printf("%*v02x ", " ", substr($stuff, $curoffset + 0, $skipchars));
+	    increment_curpos($skipchars);
+	} elsif ($cmd eq "endj") { # End Job
+	    printf("%*v02x ", " ", substr($stuff, $curoffset + 0, $skipchars));
+	    increment_curpos($skipchars);
+	} else {
+	    printf("%*v02x ", " ", substr($stuff, $curoffset + 0, $skipchars));
+	    increment_curpos($skipchars);
+	}
+    }
+}
+
+sub print_remote_SN($) {
+    my ($skipchars) = @_;
+    if ($skipchars == 1) {
+	print(" (Setup)");
+    } elsif ($skipchars == 3) {
+	my ($subcmd) = get_byte_at(1);
+	my ($arg) = get_byte_at(2);
+	if ($subcmd == 0) {
+	    print(" (Feed Sequence $arg)");
+	} elsif ($subcmd == 4) {
+	    print(" (Feed Adjustment $arg)");
+	} elsif ($subcmd == 5) {
+	    print(" (Vacuum Intensity $arg)");
+	} else {
+	    print(" (Unknown command $subcmd, arg $arg)");
+	}
+    } else {
+	print(" (Unknown command)");
+    }
+}
+
+sub print_remote_DR($) {
+    my ($skipchars) = @_;
+    if ($skipchars == 4) {
+	my ($subcmd) = get_byte_at(1);
+	my ($arg) = get_short_at(2);
+	if ($subcmd == 0) {
+	    printf(" (Scan dry time %.1f)", $arg / 10.0);
+	} elsif ($subcmd == 1) {
+	    printf(" (Page dry time %.1f)", $arg / 10.0);
+	} elsif ($subcmd == 0x40) {
+	    printf(" (Scan minimum dry time %.1f)", $arg / 10.0);
+	} else {
+	    print(" (Unknown command $subcmd, arg $arg)");
+	}
+    } else {
+	print(" (Unknown command)");
+    }
+}
+
+sub print_remote_CO($) {
+    my ($skipchars) = @_;
+    if ($skipchars == 8) {
+	my ($cmd) = get_byte_at(2);
+	my ($arg) = get_long_at(4);
+	if ($cmd == 0) {
+	    print(" (cut)");
+	} elsif ($cmd == 1) {
+	    print(" (cut all at $arg)");
+	} elsif ($cmd == 2) {
+	    print(" (cut last at $arg)");
+	} else {
+	    print(" (Unknown command $cmd)");
+	}
+    } else {
+	print(" (unknown command)");
+    }
+}
+
+sub print_remote_MI($) {
+    my ($skipchars) = @_;
+    if ($skipchars == 4) {
+	my ($media) = get_byte_at(2);
+	my ($size) = get_byte_at(3);
+	print(" (Media type $media, size code $size)");
+    } else {
+	print(" (unknown command)");
+    }
+}
+
+sub print_remote_DP($) {
+    my ($skipchars) = @_;
+    if ($skipchars == 2) {
+	my ($cmd) = get_byte_at(1);
+	if ($cmd == 0) {
+	    print(" (no duplex)");
+	} elsif ($cmd == 1) {
+	    print(" (duplex no tumble)");
+	} elsif ($cmd == 2) {
+	    print(" (duplex tumble)");
+	} else {
+	    print(" (unknown duplex command $cmd)");
+	}
+    } else {
+	print(" (unknown command)");
+    }
+}
+
+sub print_remote_PH($) {
+    my ($skipchars) = @_;
+    if ($skipchars == 2) {
+	my ($thickness) = get_byte_at(1);
+	print(" (Paper thickness $thickness)");
+    } else {
+	print(" (unknown command)");
+    }
+}
+
+sub print_remote_US($) {
+    my ($skipchars) = @_;
+    if ($skipchars == 3) {
+	my ($cmd) = get_byte_at(1);
+	my ($arg) = get_byte_at(2);
+	if ($cmd == 1) {
+	    print(" (Platen gap $arg)");
+	} else {
+	    print(" (Unknown command $cmd, arg $arg)");
+	}
+    } else {
+	print(" (unknown command)");
+    }
+}
+
+sub print_remote_FP($) {
+    my ($skipchars) = @_;
+    if ($skipchars == 3) {
+	my ($offset) = get_short_at(1);
+	print(" (Full bleed, offset $offset)");
+    } else {
+	print(" (unknown command)");
+    }
+}
+
+sub print_remote_IK($) {
+    my ($skipchars) = @_;
+    if ($skipchars == 2) {
+	my ($ink_type) = get_byte_at(1);
+	my ($ink) = $ink_type >= 0x80 ? "matte" : "photo";
+	print(" (Ink type $ink_type, probably $ink)");
+    } else {
+	print(" (unknown command)");
+    }
+}
+
+sub print_remote_JS($) {
+    my ($skipchars) = @_;
+    print(" (Job start)");
+}
+
+sub print_remote_JE($) {
+    my ($skipchars) = @_;
+    print(" (Job end)");
+}
+
+sub print_remote_PP($) {
+    my ($skipchars) = @_;
+    print(" (Set input slot, printer-specific)");
+}
+
+sub do_remote() {
+    while (fill_buffer(2) && get_raw_at(0, 2) =~ /[A-Z0-9][A-Z0-9]/) {
+	printf "\n%08x    ", $curpos;
+	my ($cmd) = get_raw_at(0, 2);
+	print $cmd;
+	increment_curpos(2);
+	fill_buffer(2);
+	my $nlchar = get_byte_at(0);
+	my $nhchar = get_byte_at(1);
+	my $skipchars;
+	if ($cmd eq "DF") {
+	    $skipchars = 0;
+	} else {
+	    $skipchars = ($nhchar * 256) + $nlchar;
+	}
+	printf(" %02x %02x ", $nlchar, $nhchar);
+	increment_curpos(2);
+	fill_buffer($skipchars);
+	print get_vector_at(0, $skipchars);
+	if ($opt_v) {
+	    if (eval "defined \&print_remote_$cmd") {
+		map { print("   "); } ($skipchars...5) if ($skipchars < 6);
+		eval "print_remote_$cmd($skipchars)";
+	    }
+	}
+	increment_curpos($skipchars);
+    }
+}
+
+sub do_remote_command() {
+    printf "\n%08x  1b  (  R ", $curpos;
+    increment_curpos(3);
+    fill_buffer(2);
+    my ($nlchar) = get_byte_at(0);
+    my ($nhchar) = get_byte_at(1);
+    my $skipchars = ($nhchar * 256) + $nlchar;
+    increment_curpos(2);
+    fill_buffer($skipchars);
+    my $rstring = get_string_at(0, $skipchars);
+    print $rstring;
+    increment_curpos($skipchars);
+    if ($rstring eq "00 ESCPR") {
+	do_escpr();
+    } else {
+	do_remote();
+    }
+}
+
+sub print_prefix_bytes($$) {
+    my ($bytes_to_print) = @_;
+    printf "\n%08x  1b ", $curpos;
+    fill_buffer($bytes_to_print);
+    print get_char_at(1), " ", get_vector_at(2, $bytes_to_print - 2);
+    increment_curpos($bytes_to_print);
+}
+
+sub print_output_data($$$$$$) {
+    my ($comptype, $bitsperpixel, $dots, $rows, $dot_scale, $color) = @_;
+    my $counter;
+    my $fchar;
+    my $last_row = 0;
+    my $first_row = -1;
+    my $i;
+    my $vstuff;
+    $dots *= 8;
+    $dots /= $dot_scale;
+    my $real_dots = $dots / $bitsperpixel;
+    if ($opt_v) {
+	my ($xcolor) = sprintf("%02x", $color);
+	print " ($xcolor color $real_dots dots, $rows rows, $bitsperpixel bits";
+    }
+    my $savedots = $dots;
+    if ($comptype == 0) {
+	foreach $i (0..$rows-1) {
+	    fill_buffer($dots / 8);
+	    print get_vector_at(0, $dots / 8) if ($opt_V);
+	    increment_curpos($dots / 8);
+	}
+    } elsif ($comptype == 1) {
+	foreach $i (0..$rows-1) {
+	    my ($found_something) = 0;
+	    $dots = $savedots / 8;
+	    my ($tstuff) = "\n    $i    ";
+	    while ($dots > 0) {
+		if ($total_length - $curoffset < 1) {
+		    fill_buffer(1);
+		}
+		$counter = ord(substr($stuff, $curoffset + 0, 1));
+		$curpos++;
+		$curoffset++;
+		if ($counter <= 127) {
+		    $counter++;
+		    if ($total_length - $curoffset < $counter) {
+			fill_buffer($counter);
+		    }
+		    if ($opt_V || ($opt_v && ! $found_something)) {
+			my $tmp = get_vector_at(0, $counter);
+			if (!($tmp =~ /^[0 ]+$/)) {
+			    $found_something = 1;
+			    $last_row = $i;
+			    if ($first_row == -1) {
+				$first_row = $i;
+			    }
+			}
+			if ($opt_V) {
+			    $tstuff .= $tmp;
+			}
+		    }
+		    $curpos += $counter;
+		    $curoffset += $counter;
+		} else {
+		    $counter = 257 - $counter;
+		    if ($total_length - $curoffset < 1) {
+			fill_buffer(1);
+		    }
+		    if ($opt_v) {
+			if (! $found_something) {
+			    my $tbyte = get_raw_at(0, 1);
+			    if ($tbyte != 0) {
+				$found_something = 1;
+				$last_row = $i;
+				if ($first_row == -1) {
+				    $first_row = $i;
+				}
+			    }
+			}
+		    } elsif ($opt_V) {
+			$fchar = sprintf "%v02x ", get_raw_at(0, 1);
+			if ($fchar ne "00 ") {
+			    $found_something = 1;
+			    $last_row = $i;
+			    if ($first_row == -1) {
+				$first_row = $i;
+			    }
+			}
+			map { $tstuff .= $fchar } (0..$counter - 1);
+		    }
+		    $curpos++;
+		    $curoffset++;
+		}
+		$dots -= $counter;
+	    }
+	    if ($opt_V && $found_something) {
+		$vstuff .= $tstuff;
+	    }
+	}
+    } else {
+	print "\nUnknown compression type $comptype!\n";
+    }
+    if ($opt_v) {
+	my ($offset) = $offsets[$color];
+	my ($first_position) = ($vertical_position / $vertical_unit)
+	    + ($first_row + $offset) * $raster_y;
+	my ($last_position) = ($vertical_position / $vertical_unit)
+	    + ($last_row + $offset) * $raster_y;
+	my ($final_position) = ($vertical_position / $vertical_unit)
+	    + ($rows + $offset) * $raster_y;
+	my ($final_horizontal) = $horizontal_position +
+	    ($real_dots * $page_mgmt_unit * $raster_x);
+	if ($print_offsets) {
+	    printf (" %d,%d+%d %.4f  %d,%d+%d %.4f  %.4f) ",
+		    $horizontal_position, $first_row, $offset, $first_position,
+		    $final_horizontal, $last_row, $offset, $last_position,
+		    $final_position);
+	} else {
+	    printf (" %d,%d %.4f  %d,%d %.4f  %.4f) ",
+		    $horizontal_position, $first_row, $first_position,
+		    $final_horizontal, $last_row, $last_position,
+		    $final_position);
+	}
+    }
+    if ($opt_V) {
+	print " $vstuff";
+    }
+}
+
+sub purge_line() {
+    fill_buffer(1);
+    while (get_raw_at(0) eq "\r") {
+	fill_buffer(1);
+	increment_curpos(1);
+    }
+}
+
+sub do_special_command() {
+    fill_buffer(8);
+    my $comptype = get_byte_at(2);
+    my $color = 0;
+    my $dots = get_short_at(6);
+    my $rows = get_byte_at(5);
+    print_prefix_bytes(8, 2);
+    print_output_data($comptype, 1, $dots, $rows, 8, $color);
+    purge_line();
+}
+
+sub do_special1_command() {
+    fill_buffer(9);
+    my $color = get_byte_at(2);
+    my $comptype = get_byte_at(3);
+    my $bitsperpixel = get_byte_at(4);
+    my $dots = get_short_at(5);
+    my $rows = get_short_at(7);
+    print_prefix_bytes(9, 1);
+    print_output_data($comptype, $bitsperpixel, $dots, $rows, 1, $color);
+    purge_line();
+}
+
+if ($opt_O) {
+    my (@stuff) = split(/,/, $opt_O);
+    map {
+	my ($key, $val) = split(/=/, $_);
+	if ($val) {
+	    $print_offsets = 1;
+	}
+	@offsets[$key] = $val;
+    } @stuff;
+}
+
+sub indent_cmd($) {
+    my ($skipchars) = @_;
+    map { print("   "); } ($skipchars...3) if ($skipchars < 4);
+}
+
+sub do_xcmd_c($) {
+    my ($skipchars) = @_;
+    my ($top, $bottom);
+    if ($skipchars == 8) {
+	$top = get_long_at(5);
+	$bottom = get_long_at(9) if ($opt_v);
+    } else {
+	$top = get_short_at(5);
+	$bottom = get_short_at(7) if ($opt_v);
+    }
+    if ($opt_v) {
+	printf (" (page format %d %d %.2f %.2f)", $top, $bottom,
+		$top / $page_mgmt_unit, $bottom / $page_mgmt_unit);
+    }
+    $initial_vertical_position = $top * $vertical_unit / $page_mgmt_unit;
+    $vertical_position = $initial_vertical_position;
+}
+
+sub do_xcmd_S($) {
+    my ($skipchars) = @_;
+    if ($opt_v) {
+	my ($width, $height);
+	if ($skipchars == 8) {
+	    $width = get_long_at(5);
+	    $height = get_long_at(9);
+	} else {
+	    $width = get_short_at(5);
+	    $height = get_short_at(7);
+	}
+	indent_cmd($skipchars);
+	printf (" (paper size %d %d %.2f %.2f)", $width, $height,
+		$width / $page_mgmt_unit, $height / $page_mgmt_unit);
+    }
+}
+
+sub do_xcmd_C($) {
+    my ($skipchars) = @_;
+    if ($opt_v) {
+	my ($length);
+	if ($skipchars == 4) {
+	    $length = get_long_at(5);
+	} else {
+	    $length = get_short_at(5);
+	}
+	indent_cmd($skipchars);
+	printf (" (page length %d %.2f)", $length, $length / $page_mgmt_unit);
+    }
+}
+
+sub do_xcmd_D($) {
+    my ($skipchars) = @_;
+    my $base = get_short_at(5);
+    my $y = get_byte_at(7);
+    my $x = get_byte_at(8);
+    $raster_x = $x / $base;
+    $raster_y = $y / $base;
+    if ($opt_v) {
+	indent_cmd($skipchars);
+	printf (" (raster base %d, %d x %d)", $base, $base / $x, $base / $y);
+    }
+}
+
+sub do_xcmd_U($) {
+    my ($skipchars) = @_;
+    my $page_mgmt = get_byte_at(5);
+    if ($skipchars == 5) {
+	my $vertical = get_byte_at(6);
+	my $horiz = get_byte_at(7);
+	my $scale = get_short_at(8);
+	$page_mgmt_unit = $scale / $page_mgmt;
+	$horizontal_unit = $scale / $horiz;
+	$vertical_unit = $scale / $vertical;
+	if ($opt_v) {
+	    indent_cmd($skipchars);
+	    printf (" (units base %d  mgmt %d  vert %d  horiz %d)",
+		    $scale, $page_mgmt_unit, $vertical_unit, $horizontal_unit);
+	}
+    } else {
+	if ($opt_v) {
+	    indent_cmd($skipchars);
+	    printf " (units base = %d/3600)", $page_mgmt;
+	}
+	$page_mgmt_unit = 3600 / $page_mgmt;
+	$horizontal_unit = 3600 / $page_mgmt;
+	$vertical_unit = 3600 / $page_mgmt;
+    }
+}
+
+sub do_xcmd_v($) {
+    my ($skipchars) = @_;
+    my ($length);
+    if ($skipchars == 4) {
+	$length = get_long_at(5);
+    } else {
+	$length = get_short_at(5);
+    }
+    $vertical_position += $length;
+    if ($opt_v) {
+	indent_cmd($skipchars);
+	printf (" (skip vertical %d at %d %.4f)", $length, $vertical_position,
+		$vertical_position / $vertical_unit);
+    }
+}
+
+sub do_xcmd_dlr($) {
+    my ($skipchars) = @_;
+    if ($skipchars == 4) {
+	$horizontal_position = get_long_at(5);
+    } else {
+	$horizontal_position = get_short_at(5);
+    }
+    if ($opt_v) {
+	indent_cmd($skipchars);
+	printf (" (horizontal position %d %.4f)",
+		$horizontal_position, $horizontal_position / $horizontal_unit);
+    }
+}
+
+sub do_xcmd_d($) {
+    my ($skipchars) = @_;
+    if ($opt_v) {
+	my ($bytes) = get_short_at(3);
+	indent_cmd($skipchars);
+	printf " (nop $bytes bytes)";
+    }
+}
+
+sub do_xcmd_m($) {
+    my ($skipchars) = @_;
+    if ($opt_v) {
+	indent_cmd($skipchars);
+	printf(" (print method %x)", get_byte_at(5));
+    }
+}
+
+sub do_xcmd_e($) {
+    my ($skipchars) = @_;
+    if ($opt_v) {
+	indent_cmd($skipchars);
+	printf(" (dot size %x)", get_byte_at(6));
+    }
+}
+
+sub do_xcmd_G($) {
+    my ($skipchars) = @_;
+    if ($opt_v) {
+	indent_cmd($skipchars);
+	print(" (set graphics mode)");
+    }
+}
+
+sub do_xcmd_K($) {
+    my ($skipchars) = @_;
+    if ($opt_v) {
+	indent_cmd($skipchars);
+	my ($ctype) = get_byte_at(6);
+	if ($ctype == 1) {
+	    print(" (BW mode)");
+	} elsif ($ctype == 2) {
+	    print(" (Color mode)");
+	} elsif ($ctype == 3) {
+	    print(" (Fast 360 color mode)");
+	} else {
+	    print(" (Unknown BW/color mode)");
+	}
+    }
+}
+
+sub do_xcmd_i($) {
+    my ($skipchars) = @_;
+    if ($opt_v) {
+	indent_cmd($skipchars);
+	my ($ctype) = get_byte_at(5);
+	if ($ctype == 0) {
+	    print(" (Soft weave)");
+	} else {
+	    printf(" (Printer weave method %d)", $ctype);
+	}
+    }
+}
+
+while (! $atend) {
+    my $found;
+    my $skipchars;
+    my $startoff;
+    my $bytes;
+    my ($maxklen) = $keylengths{$seqkeys[0]};
+    fill_buffer(1);
+    my $cchar = get_raw_at(0);
+    if ($cchar eq "$esc") {
+	$found = 0;
+	fill_buffer(2 + $maxklen);
+	foreach my $key (@seqkeys) {
+	    my ($klen) = $keylengths{$key};
+	    if (get_raw_at(1, $klen) eq $key) {
+		$skipchars = $seqtable{$key};
+		if ($skipchars eq "SPECIAL") {
+		    do_special_command();
+		    $found = 2;
+		} elsif ($skipchars eq "SPECIAL1") {
+		    do_special1_command();
+		    $found = 2;
+		} elsif ($skipchars eq "REMOTE") {
+		    do_remote_command();
+		    $found = 2;
+		} else {
+		    printf "\n%08x  1b ", $curpos;
+		    $startoff = 0;
+		    my $print_stuff = 0;
+		    my $print_variable = 0;
+		    if ($skipchars eq "VARIABLE") {
+			fill_buffer(3);
+			$print_variable = 1;
+			my $nlchar = get_byte_at($klen + 2);
+			my $nhchar = get_byte_at($klen + 3);
+			$skipchars = ($nhchar * 256) + $nlchar;
+			$startoff = 3;
+			$print_stuff = 1;
+		    }
+		    my ($blen) = $skipchars + $klen + $startoff;
+		    fill_buffer($blen + 1);
+		    print get_char_at(1), " ";
+		    if ($blen > 1) {
+			my $char = get_raw_at(2);
+			print get_char_at(2), " ";
+			if ($blen > 2) {
+			    if ($print_variable && $char eq "d") {
+				print get_vector_at(3, 2);
+			    } else {
+				print get_vector_at(3, $blen - 2);
+			    }
+			}
+		    }
+		    if ($print_stuff) {
+			my $xchar = get_raw_at(2);
+			if ($xchar eq '$') {
+			    $xchar = 'dlr';
+			}
+			if (eval defined "defined do_xcmd_$xchar") {
+			    eval "do_xcmd_$xchar($skipchars)";
+			}
+		    }
+		    $found = 1;
+		}
+		$bytes = $klen + 1 + $skipchars + $startoff;
+		last;
+	    }
+	}
+	if (! $found) {
+	    printf "\n%08x  1b ", $curpos;
+	    increment_curpos(1);
+	} elsif ($found == 1) {
+	    increment_curpos($bytes);
+	}
+    } elsif ($cchar eq "\0" || $cchar eq "\f") {
+	printf "\n%08x  $chartable{$cchar} ", $curpos;
+	$vertical_position = $initial_vertical_position;
+	increment_curpos(1);
+    } else {
+	print "$xchartable{$cchar} " if ($cchar ne "\021");
+	increment_curpos(1);
+    }
+}
+
+print "\n" if $curpos > 1;

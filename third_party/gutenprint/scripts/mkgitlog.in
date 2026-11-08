@@ -1,0 +1,160 @@
+#!@PERL@
+
+# Generate Git history.
+#
+# Copyright 2016-2017 Robert Krawitz (rlk@alum.mit.edu)
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation; either version 2 of the License, or (at your option)
+# any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+# or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+# for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+use Getopt::Long;
+
+use strict;
+
+my ($base_file);
+my ($base_revision);
+
+GetOptions("i=s" => \$base_file,
+	   "r=s" => \$base_revision);
+
+my ($autline) = "";
+my ($curmsg) = "";
+my ($curtag) = "";
+my (%addlines);
+my (%removelines);
+my (%filechanges);
+my (%files);
+my (@ignore_files) = (".travis.yml",
+    "scripts/travis/checksums",
+    "scripts/travis/integration",
+    "scripts/travis/smoke");
+
+my ($state) = 0;
+my ($ostate) = 0;
+my ($firsttime) = 1;
+
+sub print_it {
+    my (@files) = sort keys %files;
+    my (%tmp_files);
+    map {$tmp_files{$_} = 1} @files;
+    map {delete $tmp_files{$_}} @ignore_files;
+    if ($curtag ne "") {
+	print "===============================================================================\n";
+	print "Name: $curtag\n\n";
+    }
+    print "$autline\n" if (keys %tmp_files > 0);
+    if ($#files >= 0) {
+	my ($add) = 0;
+	my ($remove) = 0;
+	my $file_detail;
+	my ($fcount) = 0;
+	foreach my $fn (@files) {
+	    next if (($fn =~ /\.po$/ && $filechanges{$fn} ne 'C' &&
+		      $filechanges{$fn} ne 'D' ) ||
+		     $fn =~ /^ChangeLog\.pre/);
+	    if ($fn =~ /\.(po|eps)$/) {
+		$removelines{$fn} = 0;
+		$addlines{$fn} = 0;
+	    }
+	    if ($fcount++ == 0) {
+		$file_detail .=  "	Files:";
+		$file_detail .=  "	$fn (";
+	    } else {
+		$file_detail .=  "		$fn (";
+	    }
+	    if ($filechanges{$fn} eq 'D') {
+		$file_detail .=  "removed -$removelines{$fn}";
+		$remove += $removelines{$fn};
+	    } elsif ($filechanges{$fn} eq 'C') {
+		$file_detail .=  "added +$addlines{$fn}";
+		$add += +$addlines{$fn};
+	    } else {
+		$file_detail .=  "+$addlines{$fn}, -$removelines{$fn}";
+		$remove += $removelines{$fn};
+		$add += +$addlines{$fn};
+	    }
+	    $file_detail .=  ")\n";
+	}
+	print "	Lines: +$add, -$remove\n" if (keys %tmp_files > 0);
+	print "$file_detail\n" if (keys %tmp_files > 0);
+    }
+    print "$curmsg\n" if (keys %tmp_files > 0);
+    $autline = "";
+    $curmsg = "";
+    $curtag = "";
+    %addlines = ();
+    %removelines = ();
+    %filechanges = ();
+    %files = ();
+}
+
+if ($base_revision) {
+    $base_revision = "'$base_revision..HEAD'";
+}
+
+open(GITLOG, "git log -w --diff-algorithm=default --summary --numstat --date=short --pretty=format:'>>>GIT1%n%cd  <%an>	%H%n>>>GIT2%n%B>>>GIT3%n%D%n>>>GIT4' $base_revision -- ':(exclude)po/*.po' ':(exclude)ChangeLog.pre-5.2.11'|") or die "Can't run git log: $!\n";
+
+while (<GITLOG>) {
+    if (/>>>GIT([0-9]+)$/) {
+	$state = $1;
+	if ($state == 1) {
+	    if (! $firsttime) {
+		print_it();
+	    }
+	    $firsttime = 0;
+	}
+    } elsif ($state == 1) {
+	$autline = $_;
+    } elsif ($state == 2) {
+	if ($_ ne "\n") {
+	    $curmsg .= "	";
+	}
+	$curmsg .= $_;
+    } elsif ($state == 3) {
+	if (/tag: ((guten|gimp-)?print-[0-9]+_.*)/) {
+	    $curtag = $1;
+	}
+    } elsif ($state == 4) {
+	if ($_ ne "\n") {
+	    chomp;
+	    $_ =~ s/^[ 	]+//;
+	    if (/^delete/) {
+		my ($junk, $junk, $junk, $fn) = split(/ /, $_, 4);
+		$filechanges{$fn} = 'D';
+	    } elsif (/^create/) {
+		my ($junk, $junk, $junk, $fn) = split(/ /, $_, 4);
+		$filechanges{$fn} = 'C';
+	    } elsif (/^[-0-9]/) {
+		my ($add, $remove, $fn) = split(/	/, $_, 3);
+		$add = 0 if ($add eq '-');
+		$remove = 0 if ($remove eq '-');
+		$files{$fn} = 1;
+		$addlines{$fn} = $add;
+		$removelines{$fn} = $remove;
+	    }
+	}
+    } else {
+	die "Unknown state $state\n";
+    }
+}
+
+print_it();
+
+if ($base_file) {
+    open IN, $base_file or die "Can't open baseline file $base_file: $!";
+    while (<IN>) {
+	print;
+    }
+}
+
+exit 0;

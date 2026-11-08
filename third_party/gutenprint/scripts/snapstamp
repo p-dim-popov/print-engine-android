@@ -1,0 +1,22 @@
+#!/bin/sh
+
+# Emit a snapshot identifier if STP_BUILD_SNAPSHOT is set
+# Note that this is needed prior to autogen.sh so needs a fixed
+# shebang line.
+#
+# Copyright (C) 2019 Robert Krawitz
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2, or (at your option)
+# any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+[ -n "$STP_BUILD_SNAPSHOT" ] && [ -d .git ] && printf '%s%(%Y-%m-%dT%H-%M)T-%s' - -1 "$(git describe --dirty --always --first-parent --exclude '*')"

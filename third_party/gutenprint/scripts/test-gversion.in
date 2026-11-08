@@ -1,0 +1,50 @@
+#!@SHELL@
+
+# Copyright (C) 2017 Robert Krawitz
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2, or (at your option)
+# any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+major=5
+minor='-0 _2'
+micro='-0 _1 -12 _0a -1a _12a'
+extra='-pre0 -rc1 _beta2a'
+git='-15-g40e406b -15-g40e406b-dirty -0-g40e406b -0-g40e406b-dirty'
+
+types="
+major
+minor
+micro
+extra
+git
+git-hash
+extra-git
+core-version
+base-version
+full-version
+all
+everything"
+
+for g in $types ; do
+    (for a in $major ; do
+	 for b in $minor ; do
+	     for c in $micro ; do
+		 for d in '' $extra ; do
+		     for e in '' $git ; do
+			 echo "$a$b$c$d$e"
+		     done
+		 done
+	     done
+	 done
+     done) | ./gversion "$g" X --
+done

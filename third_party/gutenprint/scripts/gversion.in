@@ -1,0 +1,181 @@
+#!@SHELL@
+
+# Parse git version into its separate components.
+#
+# Copyright (C) 2017 Robert Krawitz
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2, or (at your option)
+# any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+
+usage() {
+    echo "Usage: $cmd [info] [default] [version]"
+    echo "       info can be empty, or one of major, minor, micro, extra, git, hash, pkg"
+    echo "       info can also be extra-git, core-version (major.minor),"
+    echo "            base-version (major.minor.micro),"
+    echo "            full-version (major.minor.micro[-extra]), or all"
+    echo "       default is the default value if not in a git repository."
+    echo "       version is the input version in lieu of git describe (for testing)"
+    exit 1
+}
+
+cmd="$0"
+
+if [ "$#" -gt 3 ] ; then
+    usage
+fi
+
+root="@PKGROOT@"
+gutenprint_version=gutenprint-@VERSION@
+gutenprint_base=gutenprint-@GUTENPRINT_BASE_VERSION@
+gutenprint_release=gutenprint-@GUTENPRINT_RELEASE_VERSION@
+
+if [ -z "$3" ] ; then
+    if [ -d "$root/.git" ] ; then
+	tag=$(git describe --tags --dirty --first-parent --candidates=1000 --match "${gutenprint_version//./_}*" 2>/dev/null)
+	[[ -z $tag ]] && tag=$(git describe --tags --dirty --first-parent --candidates=1000 --match "${gutenprint_base//./_}*" 2>/dev/null)
+	[[ -z $tag ]] && tag=$(git describe --tags --dirty --first-parent --candidates=1000 --match "${gutenprint_release//./_}*" 2>/dev/null)
+	[[ -z $tag ]] && tag=$(git describe --tags --dirty --first-parent --candidates=1000 --match "gutenprint*" 2>/dev/null)
+	[[ -z $tag ]] && tag=$(git describe --tags --dirty --always --first-parent 2>/dev/null)
+	echo $tag | sed 's/^[^0-9]*-//' > "$root/git-version-stamp"
+    fi
+
+    if [ -f "$root/git-version-stamp" ] ; then
+	# shellcheck disable=SC2006
+	description=$(cat "$root/git-version-stamp")
+    else
+	description='(unknown)'
+    fi
+else
+    description=$3
+fi
+
+# If we don't have git or this is not a repository, simply return the default value
+if [ -z "$description" ] ; then
+    echo "$2"
+    exit 0
+fi
+
+xed() {
+    if [ -n "$PREFIX" ] ; then
+	# shellcheck disable=SC1117
+	sed -e h -e "s/$/ $PREFIX => /" -e x -e 's/^[^0-9]*-//' "$@" -e H -e x -e "s/\n//"
+    else
+	sed -e 's/^[^0-9]*-//' "$@"
+    fi
+}
+
+get_major() {
+    xed -e 's/[-_\.].*//'
+}
+
+get_minor() {
+    xed -e 's/^[0-9]*[-_\.]//' \
+	-e 's/[-_\.].*//'
+}
+
+get_micro() {
+    xed -e 's/^[0-9]*[-_\.][0-9]*[-_\.]//' \
+	-e 's/[-_\.].*//'
+}
+
+get_extra() {
+    xed -e 's/^[0-9]*[-_\.][0-9]*[-_\.][0-9]*\([a-zA-Z]\|\)//' \
+	-e 's/-\([0-9]*-\|\)g[0-9a-zA-Z]*\(-dirty\|\)$//' \
+    	-e 's/^_/-/'
+}
+
+get_git() {
+    xed -e 's/^[0-9]*[-_\.][0-9]*[-_\.][0-9]*\([a-zA-Z]\|\)//' \
+	-e 's/^[-_\.][a-zA-Z][a-zA-Z]*[0-9]*\([a-zA-Z]\|\)//' \
+	-e 's/^[-_\.]/-/' \
+	-e 's/-0-g[0-9a-f]*\(-dirty\|\)//'
+}
+
+get_git_hash() {
+    xed -e 's/^[0-9]*[-_\.][0-9]*[-_\.][0-9]*\([a-zA-Z]\|\)//' \
+	-e 's/^[-_\.][a-zA-Z][a-zA-Z]*[0-9]*\([a-zA-Z]\|\)//' \
+	-e 's/^[-_\.]/-/' \
+	-e 's/^-[0-9]*-g//' \
+	-e 's/-dirty$//'
+}
+
+get_extra_git() {
+    xed -e 's/^[0-9]*[-_\.][0-9]*[-_\.][0-9]*\([a-zA-Z]\|\)//' \
+	-e 's/^[-_\.]/-/' \
+	-e 's/-0-g[0-9a-f]*\(-dirty\|\)$/\1/'
+}
+
+get_core_version() {
+    xed -e 's/^\([0-9]*[-_\.][0-9]*\).*/\1/' \
+	-e 's/[-_\.]/./g'
+}
+
+get_base_version() {
+    xed -e 's/^\([0-9]*[-_\.][0-9]*[-_\.][0-9]*\([a-zA-Z]\|\)\).*/\1/' \
+	-e 's/[-_\.]/./g'
+}
+
+get_full_version() {
+    xed -e 's/-[0-9]*-g[0-9a-z]*\(-dirty\|\)$//' \
+	-e 's/[-_\.]/=/g' \
+	-e 's/=/./' \
+	-e 's/=/./' \
+	-e 's/=/-/'
+}
+
+get_all() {
+    xed -e 's/[-_\.]/=/g' \
+	-e 's/=/./' \
+	-e 's/=/./' \
+	-e 's/=/-/g' \
+	-e 's/-0-g[0-9a-f]*\(-dirty\|\)$/\1/'
+}
+
+get_everything() {
+    xed -e 's/[-_\.]/=/g' \
+	-e 's/=/./' \
+	-e 's/=/./' \
+	-e 's/=/-/g'
+}
+
+get_pkg() {
+    echo "$gutenprint_version"
+}
+
+doit() {
+    case "$1" in
+	major)        get_major        ;;
+	minor)        get_minor        ;;
+	micro)        get_micro        ;;
+	extra)        get_extra        ;;
+	git)          get_git          ;;
+	git-hash)     get_git_hash     ;;
+	extra-git)    get_extra_git    ;;
+	core-version) get_core_version ;;
+	base-version) get_base_version ;;
+	full-version) get_full_version ;;
+	''|all)       get_all          ;;
+	everything)   get_everything   ;;
+	pkg)          get_pkg          ;;
+	*)            usage            ;;
+    esac
+}
+
+case "$description" in
+    -) doit "$1" ;;
+    --) PREFIX="$1" doit "$1" ;;
+    *) echo "$description" | doit "$1" ;;
+esac
+
+exit 0

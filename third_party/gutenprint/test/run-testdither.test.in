@@ -1,0 +1,84 @@
+#!@BASHREAL@
+
+# Driver for testdither
+#
+# Copyright 2001-2008 Robert Krawitz (rlk@alum.mit.edu)
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation; either version 2 of the License, or (at your option)
+# any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+# or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+# for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+# Don't want to run this at all as part of automated test
+[ -n "$STP_TEST_SUITE" ] && exit 77
+
+if [[ -n "$STP_TEST_LOG_PREFIX" ]] ; then
+    redir="${STP_TEST_LOG_PREFIX}${0##*/}_$$.log"
+    if [[ -n $BUILD_VERBOSE ]] ; then
+	exec > >(tee -a "$redir" >&3)
+    else
+	exec 1>>"$redir"
+    fi
+    exec 2>&1
+fi
+
+if [[ -z $srcdir || $srcdir = "." ]] ; then
+    sdir=$(pwd)
+elif grep -q '^/' <<< "$srcdir" ; then
+    sdir="$srcdir"
+else
+    sdir="$(pwd)/$srcdir"
+fi
+
+if [ -z "$STP_DATA_PATH" ] ; then
+    STP_DATA_PATH="$sdir/../src/xml"
+    export STP_DATA_PATH
+fi
+
+if [ -z "$STP_MODULE_PATH" ] ; then
+    STP_MODULE_PATH="$sdir/../src/main:$sdir/../src/main/.libs"
+    export STP_MODULE_PATH
+fi
+
+valcount=0
+valgrind=
+valopts=''
+
+set_args() {
+    while true ; do
+	case "$1" in
+	    -h*|--h*) usage ;;
+	    -v|--valgrind) valopts='--tool=memcheck' ; valcount=$((valgrind + 1)) ;;
+	    -c|--cachegrind) valopts='--tool=cachegrind'; valcount=4 ;;
+	    -g|--gdb-attach) valopts='--gdb-attach=yes' ;;
+	    -V|--verbose) quiet= ;;
+	    -q|--quiet) quiet=quiet ;;
+	    --) shift; args="$*"; return ;;
+	    *) return ;;
+	esac
+    shift
+    done
+}
+
+set_args $(getopt hgvqncV "$@")
+
+case "$valcount" in
+    1) valopts="$valopts $quiet --num-callers=100 --error-limit=no --leak-check=yes";;
+    2) valopts="$valopts --num-callers=100 --error-limit=no --leak-resolution=high --leak-check=yes" ;;
+    3) valopts="$valopts --error-limit=no --num-callers=100 --show-reachable=yes --leak-resolution=high --leak-check=yes" ;;
+    *) ;;
+esac
+
+if [ -n "$valopts" ] ; then
+    valgrind="libtool --mode=execute valgrind $valopts"
+fi
+
+$valgrind ./testdither
