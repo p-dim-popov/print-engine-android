@@ -1,0 +1,3 @@
+# CMake host builds
+/build*/
+__pycache__/

@@ -1,0 +1,42 @@
+# print-engine-android: host build tools and mise tasks.
+# Copyright (C) 2026 Petar Popov
+# GPL-2.0-or-later; see README.md and COPYING.
+
+# Host build tools. shellcheck, ruff and actionlint check the scripts, the
+# tests and the CI workflow. The host also needs a C compiler and Python 3.
+[tools]
+cmake = "4.4.4"
+ninja = "1.13.2"
+shellcheck = "0.11.0"
+ruff = "0.17.4"
+actionlint = "1.7.12"
+
+# `mise tasks` lists these; `mise run <name>` runs one with the tools above on the PATH.
+# Each mise task runs the ones it needs first, so any of them can run on its own.
+
+[tasks.configure]
+description = "Configure the host build in build/"
+run = "cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release"
+
+[tasks.build]
+description = "Build libgutenprint, the program and Gutenprint's data (build/data)"
+depends = ["configure"]
+run = "cmake --build build"
+
+[tasks.test]
+description = "Run the host tests (the program's interface, golden jobs, upstream's data check)"
+depends = ["build"]
+run = "ctest --test-dir build --output-on-failure"
+
+[tasks.guards]
+description = "Run the licence guard: every new source file carries the GPL notice"
+run = "scripts/check-licence-notices.sh"
+
+[tasks.lint]
+description = "Run shellcheck on the scripts, ruff on the Python files and actionlint on the CI workflow; any finding fails"
+run = ["shellcheck scripts/*.sh", "ruff check scripts tests", "actionlint"]
+
+# The steps of .github/workflows/ci.yml, in the same order.
+[tasks.ci]
+description = "Run every CI step in order: lint, configure, build, test, guards"
+run = [{ task = "lint" }, { task = "configure" }, { task = "build" }, { task = "test" }, { task = "guards" }]
