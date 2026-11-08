@@ -345,6 +345,22 @@ class BadRaster(unittest.TestCase):
                 self.assertIn(START_JOB, result.stdout)
                 self.assertIn(END_JOB, result.stdout[-400:])
 
+    def test_a_resolution_above_9600_dpi_exits_3(self):
+        good = pwg.solid(10, 10, 75, pwg.SGRAY, 0, page_size=pwg.A4_POINTS)
+        for x_dpi, y_dpi in ((9601, 9601), (75, 9601), (9601, 75), (100000000, 100000000),
+                             (0xFFFFFFFF, 0xFFFFFFFF)):
+            page = bytearray(good)
+            page[276:280] = x_dpi.to_bytes(4, "big")
+            page[280:284] = y_dpi.to_bytes(4, "big")
+            with self.subTest(x_dpi=x_dpi, y_dpi=y_dpi):
+                result = print_job(MP250, pwg.stream(bytes(page)), "media=" + A4)
+                self.assertEqual(result.returncode, BAD_RASTER)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn(b"resolution", result.stderr)
+                result = print_job(MP250, pwg.stream(good, bytes(page)), "media=" + A4)
+                self.assertEqual(result.returncode, BAD_RASTER)
+                self.assertIn(END_JOB, result.stdout[-400:])
+
     def test_a_run_past_the_end_of_its_line_exits_3(self):
         header = pwg.header(4, 1, 75, pwg.SGRAY)
         # One line of 4 pixels, coded as a run of 5.

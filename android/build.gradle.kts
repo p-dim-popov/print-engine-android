@@ -20,6 +20,7 @@ android {
     ndkVersion = "27.2.12479018"
 
     defaultConfig {
+        // scripts/build-android.sh builds for the API level this line names.
         minSdk = 26
         ndk {
             // Release builds ship arm64-v8a only; debug builds add x86_64 below.

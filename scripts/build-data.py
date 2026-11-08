@@ -45,7 +45,7 @@ def installed_files(source, relative=""):
         want = XML_DATA_DIR + ("/" + relative if relative else "")
         got = " ".join(found.get("pkgxmldatadir", []))
         if got != want:
-            sys.exit(f"{directory}/Makefile.am installs into {got}, expected {want}")
+            sys.exit(f"build-data.py: {directory}/Makefile.am installs into {got}, expected {want}")
     for name in files:
         yield os.path.join(relative, name)
     for subdir in found.get("SUBDIRS", []):
@@ -54,7 +54,8 @@ def installed_files(source, relative=""):
 
 def main():
     if len(sys.argv) != 3:
-        sys.exit(f"usage: {sys.argv[0]} XML_SOURCE_DIR OUTPUT_DIR")
+        sys.stderr.write("usage: build-data.py XML_SOURCE_DIR OUTPUT_DIR\n")
+        sys.exit(2)
     source, output = sys.argv[1], sys.argv[2]
     files = sorted(set(installed_files(source)))
 
@@ -65,7 +66,7 @@ def main():
                 every_xml.add(os.path.relpath(os.path.join(root, name), source))
     missed = sorted(every_xml - set(files))
     if missed:
-        sys.exit("XML files that no Makefile.am installs: " + ", ".join(missed))
+        sys.exit("build-data.py: XML files that no Makefile.am installs: " + ", ".join(missed))
 
     staging = output + ".tmp"
     shutil.rmtree(staging, ignore_errors=True)

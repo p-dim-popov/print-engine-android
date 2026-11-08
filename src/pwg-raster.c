@@ -27,6 +27,9 @@
 #define COLOR_SPACE_SRGB 19
 /* Larger pages than this are refused, not allocated: 2 m at 2400 dpi. */
 #define MAX_PIXELS 200000u
+/* Higher resolutions are refused: the printable area in pixels grows with
+   them, and no driver prints above 5760 dpi. */
+#define MAX_DPI 9600u
 
 struct pwg_reader
 {
@@ -38,6 +41,7 @@ struct pwg_reader
   unsigned lines_left;      /* lines of the page not yet returned */
   unsigned repeat;          /* times the decoded line is still to be returned */
   unsigned char *decoded;   /* the line being repeated */
+  int out_of_memory;        /* the last error was a failed allocation */
   char error[160];
 };
 
@@ -45,6 +49,7 @@ static int
 fail(pwg_reader_t *r, const char *message)
 {
   snprintf(r->error, sizeof r->error, "%s", message);
+  r->out_of_memory = 0;
   return -1;
 }
 
@@ -75,6 +80,12 @@ const char *
 pwg_reader_error(const pwg_reader_t *r)
 {
   return r->error;
+}
+
+int
+pwg_reader_out_of_memory(const pwg_reader_t *r)
+{
+  return r->out_of_memory;
 }
 
 /* Decodes one line record: the line-repeat byte, then runs of pixels. */
@@ -175,8 +186,8 @@ parse_header(pwg_reader_t *r, const unsigned char *h)
     return fail(r, "the page is neither sgray_8 nor srgb_8");
   if (color_order != 0)
     return fail(r, "the page's colours are not chunky");
-  if (p->x_dpi == 0 || p->y_dpi == 0)
-    return fail(r, "the page has no resolution");
+  if (p->x_dpi == 0 || p->y_dpi == 0 || p->x_dpi > MAX_DPI || p->y_dpi > MAX_DPI)
+    return fail(r, "the page's resolution is out of range (1 to 9600 dpi)");
   if (p->width == 0 || p->height == 0 || p->width > MAX_PIXELS || p->height > MAX_PIXELS)
     return fail(r, "the page's size in pixels is out of range");
   if (bytes_per_line != p->width * p->channels)
@@ -189,7 +200,11 @@ parse_header(pwg_reader_t *r, const unsigned char *h)
   r->repeat = 0;
   unsigned char *decoded = realloc(r->decoded, r->line_bytes);
   if (!decoded)
-    return fail(r, "out of memory");
+    {
+      fail(r, "out of memory");
+      r->out_of_memory = 1;
+      return -1;
+    }
   r->decoded = decoded;
   return 0;
 }
