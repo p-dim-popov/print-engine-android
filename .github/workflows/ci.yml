@@ -1,0 +1,35 @@
+# print-engine-android: host build, host tests and licence guard.
+# Copyright (C) 2026 Petar Popov
+# GPL-2.0-or-later; see README.md and COPYING.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    # A run takes a few minutes; a hang fails here, not at the 6-hour job limit.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      # Installs the tool versions pinned in mise.toml. Each step below is a mise
+      # task from mise.toml; `mise run ci` runs the same steps locally.
+      - uses: jdx/mise-action@v5
+
+      - name: Lint the scripts, the tests and this workflow
+        run: mise run lint
+
+      - name: Configure
+        run: mise run configure
+
+      - name: Build (libgutenprint, the program, Gutenprint's data)
+        run: mise run build
+
+      - name: Host tests (interface, golden MP250 job, coverage, upstream's data check)
+        run: mise run test
+
+      - name: Licence guard (notices in this repository's source files)
+        run: mise run guards
