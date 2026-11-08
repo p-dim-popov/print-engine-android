@@ -1,3 +1,8 @@
 # CMake host builds
 /build*/
 __pycache__/
+# The Android library module's Gradle and CMake output (the consuming app builds it)
+/android/build/
+/android/.cxx/
+.gradle/
+local.properties

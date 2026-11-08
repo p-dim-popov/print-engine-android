@@ -4,12 +4,21 @@
 #
 # Targets:
 #   gutenprint     libgutenprint 5.3.5, static, every family linked in
-#   print-engine   the program: describe and print (src/print-engine.c)
+#   print-engine   the program: describe and print (src/print-engine.c);
+#                  on Android the file is libprintengine.so
 #   data           Gutenprint's XML data for every family, in build/data
 #                  (scripts/build-data.py), the directory STP_DATA_PATH names
 #   check-duplicate-printers  host only: upstream's check of the printer data
 cmake_minimum_required(VERSION 3.22)
 project(print_engine C)
+
+# Every Android build is linked for 16 KB pages: the NDK's toolchain option
+# sets the linker's page size and hides bionic's PAGE_SIZE constant. The
+# module's Gradle build and scripts/build-android.sh both pass it; a build
+# without it fails here.
+if(ANDROID AND NOT ANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES)
+  message(FATAL_ERROR "Configure Android builds with -DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON")
+endif()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_EXTENSIONS OFF)
@@ -23,6 +32,11 @@ add_executable(print-engine
 target_compile_definitions(print-engine PRIVATE _POSIX_C_SOURCE=200809L)
 target_compile_options(print-engine PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(print-engine PRIVATE gutenprint)
+if(ANDROID)
+  # Android extracts only files named lib<name>.so from an APK's native
+  # libraries; the program is one of them.
+  set_target_properties(print-engine PROPERTIES OUTPUT_NAME libprintengine.so SUFFIX "")
+endif()
 
 if(NOT ANDROID)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
