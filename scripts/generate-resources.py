@@ -5,9 +5,12 @@
 # Copyright (C) 2026 Petar Popov
 # GPL-2.0-or-later; see README.md and COPYING.
 #
-# Usage: generate-resources.py DATA_DIR RES_DIR
+# Usage: generate-resources.py DATA_DIR LEAVE_OUT RES_DIR
 #
 # DATA_DIR is Gutenprint's data directory (scripts/build-data.py makes it).
+# LEAVE_OUT names the drivers the table leaves out, one per line; blank lines
+# and lines that start with # are skipped. The repository's list is
+# scripts/drivers-without-a4-a5-letter.txt.
 # RES_DIR gets two resource files:
 #
 # - xml/print_engine_printers.xml: one <printer mfg="..." mdl="..."
@@ -27,7 +30,9 @@
 # the data's order. Two rows whose make and model match once case, spaces and
 # a trailing "series" are set aside are one model: only the first is written.
 # The raw and ps families give no rows: their drivers write raw pixels and
-# PostScript, not a printer model's own language. A value that starts with
+# PostScript, not a printer model's own language. Nor do the drivers on the
+# LEAVE_OUT list; they are set aside before the rule of the first row, so a
+# model that another driver also gives keeps that driver. A value that starts with
 # @ or ?, which Android would read as a resource reference, fails the step.
 import hashlib
 import os
@@ -94,9 +99,17 @@ def printers(data_dir):
                     yield printer
 
 
-def rows(data_dir):
-    """The table's rows, (mfg, mdl, driver), one per model, in order."""
-    entries = list(printers(data_dir))
+def leave_out_list(path):
+    """The driver names a leave-out list holds."""
+    with open(path, encoding="utf-8") as f:
+        lines = (line.strip() for line in f)
+        return {line for line in lines if line and not line.startswith("#")}
+
+
+def rows(data_dir, leave_out):
+    """The table's rows, (mfg, mdl, driver), one per model, in order, without
+    the drivers in leave_out."""
+    entries = [printer for printer in printers(data_dir) if printer.get("driver") not in leave_out]
     candidates = []
     for printer in entries:
         model = device_id_model(printer.get("deviceid", ""))
@@ -143,11 +156,11 @@ def write(path, lines):
 
 
 def main(argv):
-    if len(argv) != 3:
-        sys.stderr.write("usage: generate-resources.py DATA_DIR RES_DIR\n")
+    if len(argv) != 4:
+        sys.stderr.write("usage: generate-resources.py DATA_DIR LEAVE_OUT RES_DIR\n")
         return 2
-    data_dir, res_dir = argv[1], argv[2]
-    table = rows(data_dir)
+    data_dir, leave_out_path, res_dir = argv[1], argv[2], argv[3]
+    table = rows(data_dir, leave_out_list(leave_out_path))
     for row in table:
         # Android's resource compiler reads an attribute value that starts
         # with @ or ? as a reference to another resource.

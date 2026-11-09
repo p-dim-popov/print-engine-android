@@ -21,6 +21,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 GENERATOR = os.path.join(HERE, "..", "scripts", "generate-resources.py")
 DATA = os.environ.get("STP_DATA_PATH", "build/data")
 PROGRAM = os.environ.get("PRINT_ENGINE", "build/print-engine")
+LEAVE_OUT = os.path.join(HERE, "..", "scripts", "drivers-without-a4-a5-letter.txt")
+# The papers a printer needs to have a row: A4, A5 and Letter, by PWG name.
+TABLE_PAPERS = {"iso_a4_210x297mm", "iso_a5_148x210mm", "na_letter_8.5x11in"}
 
 # The MP250's device ID, as measured on its USB printer interface.
 MP250_DEVICE_ID = ("MFG:Canon;CMD:BJL,BJRaster3,BSCCe,IVEC,IVECPLI;SOJ:TXT01;"
@@ -51,27 +54,69 @@ def key(make, model):
     return f"{normalised(make)}|{normalised(model)}"
 
 
-def resources(data_dir):
-    """Runs the generator on data_dir; returns the resources it wrote: the
-    table's rows, in order, as (mfg, mdl, driver), and the string resources."""
+def resources(data_dir, leave_out=(), leave_out_file=None):
+    """Runs the generator on data_dir with the leave-out list leave_out_file,
+    or else one of the drivers in leave_out; returns the resources it wrote:
+    the table's rows, in order, as (mfg, mdl, driver), and the string
+    resources."""
     with tempfile.TemporaryDirectory() as out:
-        result = subprocess.run([sys.executable, "-I", GENERATOR, data_dir, out],
+        if leave_out_file is None:
+            leave_out_file = os.path.join(out, "leave-out.txt")
+            with open(leave_out_file, "w", encoding="utf-8") as f:
+                f.write("# Drivers to leave out.\n\n"
+                        + "".join(f"{driver}\n" for driver in leave_out))
+        res = os.path.join(out, "res")
+        result = subprocess.run([sys.executable, "-I", GENERATOR, data_dir, leave_out_file, res],
                                 capture_output=True, timeout=120, check=False)
         assert result.returncode == 0, result.stderr.decode()
-        assert sorted(os.listdir(out)) == ["values", "xml"], os.listdir(out)
-        table = ET.parse(os.path.join(out, "xml", "print_engine_printers.xml")).getroot()
-        values = ET.parse(os.path.join(out, "values", "print_engine.xml")).getroot()
+        assert sorted(os.listdir(res)) == ["values", "xml"], os.listdir(res)
+        table = ET.parse(os.path.join(res, "xml", "print_engine_printers.xml")).getroot()
+        values = ET.parse(os.path.join(res, "values", "print_engine.xml")).getroot()
     rows = [(row.get("mfg"), row.get("mdl"), row.get("driver")) for row in table.iter("printer")]
     strings = {string.get("name"): string.text for string in values.iter("string")}
     return rows, strings
 
 
-def generate(data_dir):
-    return resources(data_dir)[0]
+def generate(data_dir, leave_out=()):
+    return resources(data_dir, leave_out)[0]
 
 
 def data_version(data_dir):
     return resources(data_dir)[1]["print_engine_data_version"]
+
+
+def describe(driver):
+    """The driver's describe output as (exit code, {key: [values]})."""
+    result = subprocess.run([PROGRAM, "describe", "--driver", driver],
+                            env={"STP_DATA_PATH": DATA}, capture_output=True,
+                            timeout=60, check=False)
+    found = {}
+    for line in result.stdout.decode().splitlines():
+        name, _, value = line.partition("=")
+        found.setdefault(name, []).append(value)
+    return result.returncode, found
+
+
+def data_drivers(data_dir):
+    """The driver names of the data's printers/*.xml, read as XML."""
+    directory = os.path.join(data_dir, "printers")
+    return {element.get("driver")
+            for name in os.listdir(directory) if name.endswith(".xml")
+            for element in ET.parse(os.path.join(directory, name)).getroot().iter()
+            if element.tag.rpartition("}")[2] == "printer" and element.get("driver")}
+
+
+def leave_out_list(path):
+    with open(path, encoding="utf-8") as f:
+        lines = (line.strip() for line in f)
+        return [line for line in lines if line and not line.startswith("#")]
+
+
+def describe_all(drivers):
+    """{driver: describe(driver)} for each of drivers, run side by side."""
+    drivers = sorted(set(drivers))
+    with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
+        return dict(zip(drivers, pool.map(describe, drivers)))
 
 
 def lookup(rows, device_id):
@@ -89,24 +134,37 @@ class GutenprintData(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.rows = generate(DATA)
+        cls.rows = resources(DATA, leave_out_file=LEAVE_OUT)[0]
+        cls.described = describe_all(data_drivers(DATA))
 
     def test_the_mp250s_device_id_maps_to_its_driver(self):
         self.assertEqual(lookup(self.rows, MP250_DEVICE_ID), "bjc-MP250-series")
 
-    def test_every_driver_in_the_table_is_one_the_program_knows(self):
-        drivers = sorted({driver for _, _, driver in self.rows})
-
-        def describes(driver):
-            result = subprocess.run([PROGRAM, "describe", "--driver", driver],
-                                    env={"STP_DATA_PATH": DATA}, capture_output=True,
-                                    timeout=60, check=False)
-            return driver, result.returncode
-
-        with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
-            unknown = [driver for driver, code in pool.map(describes, drivers) if code != 0]
+    def test_every_driver_in_the_table_is_one_the_program_knows_with_a4_a5_or_letter(self):
+        described = {driver: self.described.get(driver, (None, {})) for _, _, driver in self.rows}
+        unknown = [driver for driver, (code, _) in described.items() if code != 0]
         self.assertEqual(unknown, [])
-        self.assertGreater(len(drivers), 3000)
+        without_papers = [driver for driver, (_, keys) in described.items()
+                          if not TABLE_PAPERS & set(keys.get("media", []))]
+        self.assertEqual(without_papers, [])
+        self.assertGreater(len(described), 3000)
+
+    def test_a_photo_printer_without_a4_a5_or_letter_gives_no_row(self):
+        # The SELPHY CP1300 prints postcards and photo sizes only.
+        code, keys = describe("canon-cp1300")
+        self.assertEqual(code, 0)
+        self.assertIn("oe_postcard_4.16x6.24in", keys["media"])
+        self.assertFalse(TABLE_PAPERS & set(keys["media"]), keys["media"])
+        self.assertNotIn("canon-cp1300", {driver for _, _, driver in self.rows})
+        self.assertIsNone(lookup(self.rows, "MFG:Canon;MDL:SELPHY CP1300;"))
+        self.assertIn("bjc-MP250-series", {driver for _, _, driver in self.rows})
+
+    def test_the_leave_out_list_is_every_driver_without_a4_a5_or_letter(self):
+        without_papers = sorted(driver for driver, (_, keys) in self.described.items()
+                                if not TABLE_PAPERS & set(keys.get("media", [])))
+        self.assertEqual(leave_out_list(LEAVE_OUT), without_papers,
+                         "remake the list: scripts/list-drivers-without-a4-a5-letter.py"
+                         " build/print-engine build/data > scripts/drivers-without-a4-a5-letter.txt")
 
     def test_a_printer_inside_an_xml_comment_gives_no_row(self):
         # canon.xml lists the iP100 family inside a comment; Gutenprint does not load it.
@@ -139,8 +197,8 @@ def data_with(test, **files):
 class Rows(unittest.TestCase):
     """The rules by which printer entries become rows."""
 
-    def rows(self, **files):
-        return generate(data_with(self, **files))
+    def rows(self, leave_out=(), **files):
+        return generate(data_with(self, **files), leave_out)
 
     def test_a_printer_gives_a_row_from_its_device_id_and_one_from_its_name(self):
         rows = self.rows(canon='<family name="canon">'
@@ -164,13 +222,27 @@ class Rows(unittest.TestCase):
                          "</family>")
         self.assertEqual(rows[0], ("HP", "New", "hp-new"))
 
+    def test_a_driver_on_the_leave_out_list_gives_no_row_and_another_driver_keeps_its_model(self):
+        rows = self.rows(leave_out=["photo-a", "photo-b"],
+                         dyesub='<family name="dyesub">'
+                         '<printer name="Canon SELPHY A" manufacturer="Canon" driver="photo-a"'
+                         ' deviceid="MFG:Canon;MDL:SELPHY A;" />'
+                         '<printer name="Canon SELPHY B" manufacturer="Canon" driver="photo-b" />'
+                         "</family>",
+                         canon='<family name="canon">'
+                         '<printer name="Canon SELPHY A" manufacturer="Canon" driver="office-a" />'
+                         '<printer name="Canon PIXMA MP250" manufacturer="Canon" driver="bjc-mp250" />'
+                         "</family>")
+        self.assertEqual(rows, [("Canon", "SELPHY A", "office-a"),
+                                ("Canon", "PIXMA MP250", "bjc-mp250")])
+
     def test_a_value_that_android_reads_as_a_reference_fails_the_build(self):
         for name in ("Canon @string/x", "Canon ?attr/x"):
             directory = data_with(self, canon='<family name="canon">'
                                   f'<printer name="{name}" manufacturer="Canon" driver="x" />'
                                   "</family>")
             with tempfile.TemporaryDirectory() as out:
-                result = subprocess.run([sys.executable, "-I", GENERATOR, directory, out],
+                result = subprocess.run([sys.executable, "-I", GENERATOR, directory, os.devnull, out],
                                         capture_output=True, timeout=60, check=False)
             self.assertNotEqual(result.returncode, 0, name)
             self.assertIn(b"reference", result.stderr)
@@ -235,7 +307,7 @@ class Rows(unittest.TestCase):
     def test_a_data_directory_without_printer_data_fails(self):
         directory = data_with(self)
         with tempfile.TemporaryDirectory() as out:
-            result = subprocess.run([sys.executable, "-I", GENERATOR, directory, out],
+            result = subprocess.run([sys.executable, "-I", GENERATOR, directory, os.devnull, out],
                                     capture_output=True, timeout=60, check=False)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(b"no printers", result.stderr)
