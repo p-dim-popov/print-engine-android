@@ -56,9 +56,9 @@ android {
 }
 
 /**
- * Runs a Python step of this repository, `python3 -I SCRIPT INPUT OUTPUT`, where OUTPUT is
- * [outputPath] under [outputDirectory]. The output directory is emptied first, so a file that a
- * new input no longer gives does not linger.
+ * Runs a Python step of this repository, `python3 -I SCRIPT INPUT [FILE]... OUTPUT`, where the FILEs
+ * are [argumentFiles] in order and OUTPUT is [outputPath] under [outputDirectory]. The output directory
+ * is emptied first, so a file that a new input no longer gives does not linger.
  */
 @CacheableTask
 abstract class PythonStep : DefaultTask() {
@@ -69,6 +69,11 @@ abstract class PythonStep : DefaultTask() {
     @get:InputDirectory
     @get:PathSensitive(PathSensitivity.RELATIVE)
     abstract val input: DirectoryProperty
+
+    /** Files the script reads after [input], given in this order; none by default. */
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.NONE)
+    abstract val argumentFiles: ConfigurableFileCollection
 
     /** Where in [outputDirectory] the script writes; empty for the directory itself. */
     @get:Input
@@ -89,7 +94,10 @@ abstract class PythonStep : DefaultTask() {
         val output = outputDirectory.get().asFile
         output.mkdirs()
         exec.exec {
-            commandLine("python3", "-I", script.get().asFile, input.get().asFile, output.resolve(outputPath.get()))
+            commandLine(
+                listOf("python3", "-I", script.get().asFile, input.get().asFile) + argumentFiles.files +
+                    output.resolve(outputPath.get()),
+            )
         }
     }
 }
@@ -106,11 +114,13 @@ val printEngineData = tasks.register<PythonStep>("printEngineData") {
 }
 
 // The resources the data gives: xml/print_engine_printers, the (MFG, MDL) table of the printers
-// the data drives, and the string print_engine_data_version, which names a copy of the data.
+// the data drives, without the drivers that have none of A4, A5 and Letter, and the string
+// print_engine_data_version, which names a copy of the data.
 val printEngineResources = tasks.register<PythonStep>("printEngineResources") {
     script = layout.projectDirectory.file("../scripts/generate-resources.py")
     val asset = dataAsset
     input = printEngineData.flatMap { it.outputDirectory.dir(asset) }
+    argumentFiles.from(layout.projectDirectory.file("../scripts/drivers-without-a4-a5-letter.txt"))
     outputPath = ""
     outputDirectory = layout.buildDirectory.dir("generated/printengine/res")
 }
